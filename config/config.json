@@ -1,0 +1,55 @@
+{
+    "communication": {
+        "lcr_port": "/dev/cu.PL2303G-USBtoUART1240",
+        "hioki_ip": "192.168.10.5",
+        "hioki_port": 6866,
+        "plc_ip": "192.168.250.1",
+        "plc_port": 9600,
+        "pc_node": 2,
+        "plc_node": 1,
+        "simulation": false,
+        "labjack_duration": 1.0
+    },
+    "plc_dm_addresses": {
+        "ctrl_addr": 100,
+        "res_addr": 101
+    },
+    "compensation": {
+        "lcr_comp_r": 0.0,
+        "lcr_comp_l": 0.0
+    },
+    "product_models": {
+        "22MP224": {
+            "table_id": 2,
+            "R": [10.0, 15.0],
+            "L": [100.0, 120.0],
+            "AREA": 5.0,
+            "Vp_min": 4.0,
+            "THD_max": 5.0
+        },
+        "22MP424": {
+            "table_id": 1,
+            "R": [20.0, 80.0],
+            "L": [2.0, 20.0],
+            "AREA": 7.0,
+            "Vp_min": 4.0,
+            "THD_max": 5.0
+        },
+        "22MP448": {
+            "table_id": 5,
+            "R": [5.0, 8.0],
+            "L": [80.0, 90.0],
+            "AREA": 10.0,
+            "Vp_min": 4.0,
+            "THD_max": 5.0
+        },
+        "19xxxx": {
+            "table_id": 10,
+            "R": [5.0, 8.0],
+            "L": [80.0, 90.0],
+            "AREA": 10.0,
+            "Vp_min": 4.0,
+            "THD_max": 5.0
+        }
+    }
+}

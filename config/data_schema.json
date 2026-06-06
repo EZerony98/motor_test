@@ -1,0 +1,20 @@
+{
+    "sn":          {"col_name": "产品SN",            "type": "str"},
+    "r_val":       {"col_name": "静态电阻（mΩ）",     "type": "float"},
+    "l_val":       {"col_name": "静态电感（μH）",     "type": "float"},
+    "hioki_val":   {"col_name": "静态匝间（%）",     "type": "float"},
+    "u_vp":        {"col_name": "U相Vp（V）",         "type": "float"},
+    "v_vp":        {"col_name": "V相Vp（V）",         "type": "float"},
+    "w_vp":        {"col_name": "W相Vp（V）",         "type": "float"},
+    "u_thd":       {"col_name": "U相THD（%）",        "type": "float"},
+    "v_thd":       {"col_name": "V相THD（%）",        "type": "float"},
+    "w_thd":       {"col_name": "W相THD（%）",        "type": "float"},
+    "u_harmonics": {"col_name": "U相2345谐波（%）",   "type": "str"},
+    "v_harmonics": {"col_name": "V相2345谐波（%）",   "type": "str"},
+    "w_harmonics": {"col_name": "W相2345谐波（%）",   "type": "str"},
+    "uv_phase":    {"col_name": "UV相位差（°）",      "type": "float"},
+    "vw_phase":    {"col_name": "VW相位差（°）",      "type": "float"},
+    "wu_phase":    {"col_name": "WU相位差（°）",      "type": "float"},
+    "judgment":    {"col_name": "判断",              "type": "str"},
+    "timestamp":   {"col_name": "时间",              "type": "str"}
+}

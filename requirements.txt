@@ -1,0 +1,33 @@
+altgraph @ file:///System/Volumes/Data/SWE/Apps/DT/BuildRoots/BuildRoot7/ActiveBuildRoot/Library/Caches/com.apple.xbs/Sources/python3/python3-133.100.1.1/altgraph-0.17.2-py2.py3-none-any.whl
+certifi==2026.2.25
+charset-normalizer==3.4.6
+click==8.1.8
+deprecation==2.1.0
+future @ file:///System/Volumes/Data/SWE/Apps/DT/BuildRoots/BuildRoot7/ActiveBuildRoot/Library/Caches/com.apple.xbs/Sources/python3/python3-133.100.1.1/future-0.18.2-py3-none-any.whl
+hightime==1.0.0
+idna==3.11
+importlib_metadata==8.7.1
+labjack-ljm==1.23.0
+macholib @ file:///System/Volumes/Data/SWE/Apps/DT/BuildRoots/BuildRoot7/ActiveBuildRoot/Library/Caches/com.apple.xbs/Sources/python3/python3-133.100.1.1/macholib-1.15.2-py2.py3-none-any.whl
+nidaqmx==1.5.0
+nitypes==1.0.1
+numpy==2.0.2
+packaging==26.0
+psycopg2-binary==2.9.11
+pyinstaller==6.19.0
+pyinstaller-hooks-contrib==2026.4
+pyqtgraph==0.13.7
+pyserial==3.5
+PySide6==6.10.1
+PySide6_Addons==6.10.1
+PySide6_Essentials==6.10.1
+python-decouple==3.8
+PyVISA==1.14.1
+PyVISA-py==0.7.2
+requests==2.32.5
+shiboken6==6.10.1
+six @ file:///System/Volumes/Data/SWE/Apps/DT/BuildRoots/BuildRoot7/ActiveBuildRoot/Library/Caches/com.apple.xbs/Sources/python3/python3-133.100.1.1/six-1.15.0-py2.py3-none-any.whl
+typing_extensions==4.15.0
+tzlocal==5.3.1
+urllib3==1.26.20
+zipp==3.23.0
