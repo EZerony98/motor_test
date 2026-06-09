@@ -9,216 +9,195 @@ class HiokiDriver:
         self.timeout = timeout
         self.client = None
         self.is_connected = False
+        self.last_comm_ok = False
         self.simulation_mode = False
+        self.reconnect_delay = 0.5
+        self.use_table_switch_command = True
+        self.table_command_template = ":TABLE:SELECT {table}"
+        self.table_settle_sec = 0.8
+        self.remote_before_start = True
+        self.test_wait_sec = 5.0
 
-    def connect(self, ip_address):
-        """建立 Socket 连接"""
-        if not ip_address: return False
-        self.ip = ip_address
+    @staticmethod
+    def normalize_ip(ip_address):
+        """兼容仪器界面显示的 192.168.010.005 这种补零写法。"""
+        if not ip_address:
+            return ""
+        parts = str(ip_address).strip().split(".")
+        if len(parts) != 4:
+            return str(ip_address).strip()
+        try:
+            return ".".join(str(int(part)) for part in parts)
+        except ValueError:
+            return str(ip_address).strip()
+
+    def connect(self, ip_address=None):
+        """建立 LAN Socket 连接。仪器页面 TERM 需为 CR+LF。"""
+        if ip_address:
+            self.ip = self.normalize_ip(ip_address)
+        if not self.ip:
+            return False
 
         if self.simulation_mode:
             self.is_connected = True
+            self.last_comm_ok = True
             return True
 
+        self.close()
         try:
-            print(f"=== 连接 Hioki (ST9000兼容模式): {self.ip}:{self.port} ===")
+            print(f"=== 连接 Hioki: {self.ip}:{self.port} ===")
             self.client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.client.settimeout(self.timeout)
-            self.client.connect((self.ip, self.port))
-            print("✅ Socket 连接成功")
+            self.client.connect((self.ip, int(self.port)))
             self.is_connected = True
+            self.last_comm_ok = True
+            print("✅ 连接成功")
+            time.sleep(0.2)
             return True
         except Exception as e:
             print(f"❌ 连接失败: {e}")
+            self.last_comm_ok = False
             self.close()
             return False
 
-    import socket
-    import time
+    def ensure_connected(self):
+        if self.simulation_mode:
+            self.is_connected = True
+            return True
+        if self.is_connected and self.client:
+            return True
+        return self.connect(self.ip)
 
-    class HiokiDriver:
-        def __init__(self, port=6866, timeout=5):
-            self.ip = ""
-            self.port = port
-            self.timeout = timeout
-            self.client = None
-            self.is_connected = False
-            self.simulation_mode = False
+    def send_cmd(self, cmd_str, retry=True):
+        if self.simulation_mode:
+            return True
+        if not self.ensure_connected():
+            return False
 
-        def connect(self, ip_address):
-            """建立 Socket 连接"""
-            if not ip_address: return False
-            self.ip = ip_address
+        try:
+            print(f"[Hioki] >> {cmd_str}")
+            full_cmd = f"{cmd_str}\r\n"
+            self.client.sendall(full_cmd.encode("ascii"))
+            return True
+        except Exception as e:
+            print(f"发送异常: {e}")
+            self.last_comm_ok = False
+            self.close()
+            if retry and self.ip:
+                print("Hioki 连接已断开，正在重连并重发指令...")
+                time.sleep(self.reconnect_delay)
+                if self.connect(self.ip):
+                    return self.send_cmd(cmd_str, retry=False)
+            return False
 
-            if self.simulation_mode:
-                self.is_connected = True
-                return True
+    def read_resp(self):
+        if not self.client:
+            return None
+        try:
+            data = self.client.recv(4096)
+            if data:
+                return data.decode("ascii", errors="ignore").strip()
+            self.last_comm_ok = False
+            self.close()
+            return None
+        except socket.timeout:
+            return None
+        except Exception as e:
+            print(f"读取异常: {e}")
+            self.last_comm_ok = False
+            self.close()
+            return None
 
-            try:
-                print(f"=== 连接 Hioki (ST9000兼容模式): {self.ip}:{self.port} ===")
-                self.client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.client.settimeout(self.timeout)
-                self.client.connect((self.ip, self.port))
-                print("✅ Socket 连接成功")
-                self.is_connected = True
-                return True
-            except Exception as e:
-                print(f"❌ 连接失败: {e}")
-                self.close()
-                return False
+    def query_cmd(self, cmd_str, wait_sec=0.1):
+        if not self.send_cmd(cmd_str, retry=False):
+            return None
+        time.sleep(wait_sec)
+        return self.read_resp()
 
-        def send_cmd(self, cmd_str):
-            if not self.client: return
-            try:
-                # 必须加 \r\n，对应屏幕上的 TERM: CR+LF
-                full_cmd = f"{cmd_str}\r\n"
-                self.client.sendall(full_cmd.encode('ascii'))
-            except Exception as e:
-                print(f"发送异常: {e}")
+    def diagnose(self):
+        """返回一组基础通讯诊断结果，用来判断命令解释器是否响应。"""
+        if not self.connect(self.ip):
+            return {"connect": "FAIL"}
 
-        def read_resp(self):
-            if not self.client: return None
-            try:
-                data = self.client.recv(4096)
-                if data:
-                    return data.decode('ascii', errors='ignore').strip()
-                return None
-            except socket.timeout:
-                return None
-            except Exception as e:
-                print(f"读取异常: {e}")
-                return None
+        commands = [
+            "*IDN?",
+            ":SYSTem:REMote",
+            "*IDN?",
+            ":SYSTem:ERRor?",
+            ":STATus:ERRor?",
+            ":ESR?",
+            ":MEMory:FETCh?",
+            ":FETCh?"
+        ]
 
-        def switch_table(self, table_num):
-            """
-            发送指令切换测试 Table
-            """
-            if self.simulation_mode:
-                print(f"[Hioki] 模拟切换到 Table {table_num}")
-                return True
-
-            if not self.is_connected:
-                return False
-
-            try:
-                cmd = f":table:select {table_num}"
-                print(f"[Hioki] 发送切换指令: {cmd}")
-                self.send_cmd(cmd)
-                # 切换表格可能需要一点时间，建议等待 0.2 ~ 0.5 秒
-                time.sleep(0.3)
-                return True
-            except Exception as e:
-                print(f"❌ 切换 Table 失败: {e}")
-                return False
-
-        def get_data(self):
-            """
-            执行标准测试流程并解析所有参数
-            返回: (Status, Data_Dict)
-            """
-            # 模拟模式 (调试用)
-            if self.simulation_mode:
-                time.sleep(1)
-                fake_data = {
-                    "AREA": "-2.68", "DIFF": "4.01", "FLTR": "2079",
-                    "LAPC": "141", "LC": "1.181E-14", "RC": "2.251E-08", "DCHG": "2.51"
-                }
-                return "PASS", fake_data
-
-            if not self.is_connected: return "ERR", {}
-
-            try:
-                # 1. 启动测试
-                self.send_cmd(":start")
-
-                # 2. 等待测试完成 (ST4030 通常需要几秒)
-                time.sleep(3.0)
-
-                # 3. 获取全量数据
-                self.send_cmd(":fetch? all")
-
-                # 4. 读取并解析
-                raw_data = self.read_resp()
-
-                if raw_data:
-                    print(f"🎉 收到原始数据: {raw_data}")
-                    # 示例数据: 0,PASS, -2.68,IN , 4.01,IN , 2079,IN , 141,IN , 1.181E-14, 2.251E-08,IN , 2.51,IN
-
-                    # 去除空格并分割
-                    parts = [p.strip() for p in raw_data.split(',')]
-
-                    # 创建数据字典
-                    data = {
-                        "Raw": raw_data,
-                        "Status": "ERR"
-                    }
-
-                    # 根据您的截图，数据长度至少有 14 项
-                    if len(parts) >= 10:
-                        # --- 基础解析 ---
-                        data["Status"] = parts[1]  # PASS/FAIL
-                        data["AREA"] = parts[2]  # 面积差 (例如 -2.68)
-                        data["DIFF"] = parts[4]  # 差分面积 (例如 4.01)
-                        data["FLTR"] = parts[6]  # 波形颤动 (例如 2079)
-
-                        # --- 关键参数 (您特别关注的) ---
-                        data["LAPC"] = parts[8]  # 二阶微分 (例如 141)
-
-                        # --- LCRC 参数 (屏幕右上角/底部) ---
-                        data["LC"] = parts[10]  # 电感/电容 (例如 1.181E-14 -> 11.81f)
-                        data["RC"] = parts[11]  # 电阻/响应 (例如 2.251E-08 -> 22.51n)
-
-                        # --- 放电量 (通常在倒数第2位) ---
-                        if len(parts) >= 14:
-                            data["DCHG"] = parts[-2]  # 例如 2.51
-
-                        # 返回: (总判定, 详细数据字典)
-                        return data["Status"], data
-                    else:
-                        return "ERR", {"Raw": raw_data, "Error": "Data too short"}
+        result = {"connect": "OK"}
+        try:
+            for cmd in commands:
+                if cmd.endswith("?"):
+                    result[cmd] = self.query_cmd(cmd, wait_sec=0.2)
                 else:
-                    return "ERR", {"Error": "Timeout"}
-
-            except Exception as e:
-                print(f"❌ 流程异常: {e}")
-                return "ERR", {"Error": str(e)}
-
-        def close(self):
-            if self.client:
-                try:
-                    self.client.close()
-                except:
-                    pass
-            self.is_connected = False
+                    result[cmd] = "SEND_OK" if self.send_cmd(cmd, retry=False) else "SEND_FAIL"
+                    time.sleep(0.2)
+            return result
+        finally:
+            self.close()
 
     def switch_table(self, table_num):
-        """
-        发送指令切换测试 Table
-        """
+        table_num = int(table_num)
         if self.simulation_mode:
             print(f"[Hioki] 模拟切换到 Table {table_num}")
             return True
 
-        if not self.is_connected:
-            return False
-
-        try:
-            cmd = f":table:select {table_num}"
-            print(f"[Hioki] 发送切换指令: {cmd}")
-            self.send_cmd(cmd)
-            # 切换表格可能需要一点时间，建议等待 0.2 ~ 0.5 秒
-            time.sleep(0.3)
+        if not self.use_table_switch_command:
+            print(f"[Hioki] 跳过通讯切表，使用仪器当前 TABLE（目标: {table_num:03d}）")
             return True
-        except Exception as e:
-            print(f"❌ 切换 Table 失败: {e}")
+
+        if self.remote_before_start:
+            if not self.send_cmd(":SYSTem:REMote", retry=False):
+                return False
+            time.sleep(0.2)
+
+        cmd = self.table_command_template.format(table=table_num, table03=f"{table_num:03d}")
+        print(f"[Hioki] 发送切换指令: {cmd}")
+        if not self.send_cmd(cmd, retry=False):
             return False
+        time.sleep(self.table_settle_sec)
+        return True
+
+    def run_test(self, table_num):
+        """用一条全新的连接完成切表、启动、读取，避免复用失效 socket。"""
+        if self.simulation_mode:
+            self.switch_table(table_num)
+            return self.get_data()
+
+        last_error = {"Error": "Unknown"}
+        for attempt in range(2):
+            self.close()
+            if not self.connect(self.ip):
+                return "ERR", {"Error": "Connect failed"}
+
+            try:
+                if not self.switch_table(table_num):
+                    last_error = {"Error": "Switch table failed"}
+                    continue
+
+                result, data = self.get_data()
+                if result != "ERR":
+                    self.last_comm_ok = True
+                    return result, data
+                last_error = data
+                print(f"Hioki 第 {attempt + 1} 次测试流程失败: {data.get('Error', 'Unknown')}")
+            finally:
+                self.close()
+
+            if attempt == 0:
+                time.sleep(0.8)
+
+        self.last_comm_ok = False
+        return "ERR", last_error
 
     def get_data(self):
-        """
-        执行标准测试流程并解析所有参数
-        返回: (Status, Data_Dict)
-        """
-        # 模拟模式 (调试用)
+        """执行匝间测试并返回 (判定, 数据字典)。"""
         if self.simulation_mode:
             time.sleep(1)
             fake_data = {
@@ -227,68 +206,91 @@ class HiokiDriver:
             }
             return "PASS", fake_data
 
-        if not self.is_connected: return "ERR", {}
+        if not self.ensure_connected():
+            return "ERR", {"Error": "Not connected"}
 
-        try:
-            # 1. 启动测试
-            self.send_cmd(":start")
+        if self.remote_before_start:
+            # ST4030A 面板底部显示 LOCAL 时，先切到远程控制再启动测试。
+            self.send_cmd(":SYSTem:REMote", retry=False)
+            time.sleep(0.2)
 
-            # 2. 等待测试完成 (ST4030 通常需要几秒)
-            time.sleep(3.0)
+        if not self.send_cmd(":START", retry=False):
+            self.last_comm_ok = False
+            return "ERR", {"Error": "Start command failed"}
 
-            # 3. 获取全量数据
-            self.send_cmd(":fetch? all")
+        time.sleep(self.test_wait_sec)
 
-            # 4. 读取并解析
-            raw_data = self.read_resp()
+        raw_data = self.fetch_all()
+        if not raw_data:
+            self.last_comm_ok = False
+            return "ERR", {"Error": "Timeout"}
 
-            if raw_data:
-                print(f"🎉 收到原始数据: {raw_data}")
-                # 示例数据: 0,PASS, -2.68,IN , 4.01,IN , 2079,IN , 141,IN , 1.181E-14, 2.251E-08,IN , 2.51,IN
+        self.last_comm_ok = True
+        return self.parse_fetch_all(raw_data)
 
-                # 去除空格并分割
-                parts = [p.strip() for p in raw_data.split(',')]
+    def fetch_all(self):
+        commands = [":MEMory:FETCh?", ":FETCh?", ":FETCh? ALL", ":FETCh:ALL?"]
+        for cmd in commands:
+            for attempt in range(2):
+                if not self.ensure_connected():
+                    return None
+                if not self.send_cmd(cmd, retry=False):
+                    break
+                raw_data = self.read_resp()
+                if raw_data:
+                    print(f"🎉 {cmd} 收到原始数据: {raw_data}")
+                    return raw_data
+                if attempt == 0:
+                    print(f"Hioki {cmd} 首次读取为空，重试...")
+                    time.sleep(0.8)
 
-                # 创建数据字典
-                data = {
-                    "Raw": raw_data,
-                    "Status": "ERR"
-                }
+            print(f"Hioki {cmd} 未读到数据，尝试下一种读取命令...")
+            self.close()
+            time.sleep(0.3)
+        return None
 
-                # 根据您的截图，数据长度至少有 14 项
-                if len(parts) >= 10:
-                    # --- 基础解析 ---
-                    data["Status"] = parts[1]  # PASS/FAIL
-                    data["AREA"] = parts[2]  # 面积差 (例如 -2.68)
-                    data["DIFF"] = parts[4]  # 差分面积 (例如 4.01)
-                    data["FLTR"] = parts[6]  # 波形颤动 (例如 2079)
+    @staticmethod
+    def parse_fetch_all(raw_data):
+        parts = [p.strip().strip('"') for p in raw_data.split(",")]
+        if len(parts) < 10:
+            return "ERR", {"Raw": raw_data, "Error": "Data too short"}
 
-                    # --- 关键参数 (您特别关注的) ---
-                    data["LAPC"] = parts[8]  # 二阶微分 (例如 141)
+        label_values = {}
+        for i in range(0, len(parts) - 1, 2):
+            label_values[parts[i].upper()] = parts[i + 1]
 
-                    # --- LCRC 参数 (屏幕右上角/底部) ---
-                    data["LC"] = parts[10]  # 电感/电容 (例如 1.181E-14 -> 11.81f)
-                    data["RC"] = parts[11]  # 电阻/响应 (例如 2.251E-08 -> 22.51n)
+        if "TOTAL JUDGE" in label_values:
+            data = {
+                "Raw": raw_data,
+                "Status": label_values.get("TOTAL JUDGE", "ERR"),
+                "AREA": label_values.get("AREA VALUE", ""),
+                "DIFF": label_values.get("DIFF VALUE", ""),
+                "FLTR": label_values.get("FLUTTER VALUE", ""),
+                "LAPC": label_values.get("LAPLACIAN VALUE", ""),
+                "LC": "",
+                "RC": "",
+                "DCHG": label_values.get("DISCHARGE VALUE", "")
+            }
+            return data["Status"], data
 
-                    # --- 放电量 (通常在倒数第2位) ---
-                    if len(parts) >= 14:
-                        data["DCHG"] = parts[-2]  # 例如 2.51
-
-                    # 返回: (总判定, 详细数据字典)
-                    return data["Status"], data
-                else:
-                    return "ERR", {"Raw": raw_data, "Error": "Data too short"}
-            else:
-                return "ERR", {"Error": "Timeout"}
-
-        except Exception as e:
-            print(f"❌ 流程异常: {e}")
-            return "ERR", {"Error": str(e)}
+        data = {
+            "Raw": raw_data,
+            "Status": parts[1],
+            "AREA": parts[2],
+            "DIFF": parts[4],
+            "FLTR": parts[6],
+            "LAPC": parts[8],
+            "LC": parts[10] if len(parts) > 10 else "",
+            "RC": parts[11] if len(parts) > 11 else "",
+            "DCHG": parts[-2] if len(parts) >= 14 else ""
+        }
+        return data["Status"], data
 
     def close(self):
         if self.client:
             try:
                 self.client.close()
-            except:
+            except Exception:
                 pass
+        self.client = None
         self.is_connected = False

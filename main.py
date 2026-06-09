@@ -51,14 +51,18 @@ class TestThread(QThread):
         self.sn, self.tasks, self.model_name = sn, tasks, model_name
         self.labjack_duration = labjack_duration
 
+    @staticmethod
+    def _range_from_specs(specs, range_key, min_key, max_key, default_min, default_max):
+        if range_key in specs and isinstance(specs[range_key], (list, tuple)) and len(specs[range_key]) >= 2:
+            return float(specs[range_key][0]), float(specs[range_key][1])
+        return float(specs.get(min_key, default_min)), float(specs.get(max_key, default_max))
+
     def run(self):
         specs = SpecManager.get_specs(self.model_name) or {}
         r_min, r_max = specs.get('R', [0.0, 999.0])
         l_min, l_max = specs.get('L', [0.0, 999.0])
-        vp_range = specs.get('Vp', [4.0, 999.0])
-        thd_range = specs.get('THD', [0.0, 5.0])
-        vp_min, vp_max = vp_range[0], vp_range[1]
-        thd_min, thd_max = thd_range[0], thd_range[1]
+        vp_min, vp_max = self._range_from_specs(specs, 'Vp', 'Vp_min', 'Vp_max', 4.0, 999.0)
+        thd_min, thd_max = self._range_from_specs(specs, 'THD', 'THD_min', 'THD_max', 0.0, 5.0)
 
         result = {
             "sn": self.sn,
@@ -70,7 +74,12 @@ class TestThread(QThread):
             "Phase": {"val": "未测试", "pass": True, "raw_diffs": [0.0, 0.0, 0.0]},
             "is_pass": True,
             "R_raw": 0.0, "L_raw": 0.0,
-            "BEMF": {"pass": True, "raw_peaks": [0.0] * 3, "raw_thds": [0.0] * 3, "raw_harmonics": [[0.0] * 4] * 3}
+            "BEMF": {
+                "pass": True,
+                "raw_peaks": [0.0, 0.0, 0.0],
+                "raw_thds": [0.0, 0.0, 0.0],
+                "raw_harmonics": [[0.0, 0.0, 0.0, 0.0] for _ in range(3)]
+            }
         }
 
         # 1. 静态电阻电感
@@ -91,29 +100,45 @@ class TestThread(QThread):
 
         # 2. 静态匝间
         if self.tasks.get('hioki'):
-            if hasattr(self.hioki, 'switch_table') and getattr(self.hioki, 'is_connected', False):
-                self.hioki.switch_table(specs.get('table_id', 1))
-            time.sleep(0.5)
             try:
-                res_h, data_dict = self.hioki.get_data() if hasattr(self.hioki, 'get_data') else ("PASS", {})
+                table_id = specs.get('table_id', 1)
+                if hasattr(self.hioki, 'run_test'):
+                    res_h, data_dict = self.hioki.run_test(table_id)
+                else:
+                    if hasattr(self.hioki, 'switch_table') and not self.hioki.switch_table(table_id):
+                        result["Hioki"] = {"val": "切表失败", "pass": False, "raw": 0.0}
+                        result["is_pass"] = False
+                        self.hioki.is_connected = False
+                        self.finished_signal.emit(result)
+                        return
+                    time.sleep(0.8)
+                    res_h, data_dict = self.hioki.get_data() if hasattr(self.hioki, 'get_data') else ("PASS", {})
+
                 if res_h == "ERR":
-                    result["Hioki"] = {"val": "通讯异常", "pass": False, "raw": 0.0}
+                    err_msg = data_dict.get("Error", "通讯异常") if isinstance(data_dict, dict) else "通讯异常"
+                    result["Hioki"] = {"val": err_msg, "pass": False, "raw": 0.0}
                     result["is_pass"] = False
                     self.hioki.is_connected = False
                 else:
                     h_ok = (res_h == "PASS")
                     area_val = data_dict.get('AREA', 0.0)
-                    result["Hioki"] = {"val": f"{area_val}", "pass": h_ok, "raw": float(area_val)}
+                    try:
+                        area_raw = float(area_val)
+                    except (TypeError, ValueError):
+                        area_raw = 0.0
+                    result["Hioki"] = {"val": f"{area_val}", "pass": h_ok, "raw": area_raw}
                     if not h_ok: result["is_pass"] = False
-            except Exception:
-                result["Hioki"] = {"val": "通讯异常", "pass": False, "raw": 0.0}
+            except Exception as e:
+                result["Hioki"] = {"val": f"通讯异常: {e}", "pass": False, "raw": 0.0}
                 result["is_pass"] = False
                 self.hioki.is_connected = False
 
         # 3. 动态反电势
         if self.tasks.get('labjack'):
             if not self.labjack.is_connected:
-                result["U"] = result["V"] = result["W"] = {"val": "设备未连接", "pass": False}
+                result["U"] = {"val": "设备未连接", "pass": False}
+                result["V"] = {"val": "设备未连接", "pass": False}
+                result["W"] = {"val": "设备未连接", "pass": False}
                 result["Phase"]["pass"] = False
                 result["BEMF"]["pass"] = False
                 result["is_pass"] = False
@@ -144,7 +169,9 @@ class TestThread(QThread):
                     result["BEMF"] = {"pass": bemf_ok, "raw_peaks": peaks, "raw_thds": thds, "raw_harmonics": harmonics}
                     if not bemf_ok: result["is_pass"] = False
                 else:
-                    result["U"] = result["V"] = result["W"] = {"val": "抓取失败", "pass": False}
+                    result["U"] = {"val": "抓取失败", "pass": False}
+                    result["V"] = {"val": "抓取失败", "pass": False}
+                    result["W"] = {"val": "抓取失败", "pass": False}
                     result["Phase"]["pass"] = False
                     result["BEMF"]["pass"] = False
                     result["is_pass"] = False
@@ -202,6 +229,10 @@ class MotorTestApp:
         self.sn_row_map = {}
         self.current_batch_id = time.strftime("%Y%m%d_%H%M%S")
         self.current_batch_file = os.path.join("data", "batches", f"batch_{self.current_batch_id}.csv")
+        self.auto_thread = None
+        self.is_auto_mode = False
+        self.plc_ctrl_addr = 100
+        self.plc_res_addr = 101
 
         self.data_schema = {}
         self.load_data_schema()
@@ -248,9 +279,6 @@ class MotorTestApp:
 
         self.refresh_hardware_status()
         self.ui.show()
-
-        self.auto_thread = None
-        self.is_auto_mode = False
 
     def load_data_schema(self):
         schema_path = "config/data_schema.json"
@@ -311,12 +339,39 @@ class MotorTestApp:
                 with open("config/config.json", "r", encoding="utf-8") as f:
                     data = json.load(f)
                     comm = data.get("communication", {})
+                    simulation = bool(comm.get("simulation", False))
+
                     self.lcr.port = comm.get("lcr_port", "")
+                    self.lcr.baudrate = int(comm.get("lcr_baudrate", self.lcr.baudrate))
+                    self.lcr.simulation_mode = simulation
+
                     self.hioki.ip = comm.get("hioki_ip", "")
+                    self.hioki.port = int(comm.get("hioki_port", self.hioki.port))
+                    self.hioki.use_table_switch_command = comm.get("hioki_use_table_command", True)
+                    self.hioki.remote_before_start = comm.get("hioki_remote_before_start", True)
+                    self.hioki.test_wait_sec = float(comm.get("hioki_test_wait_sec", self.hioki.test_wait_sec))
+                    self.hioki.simulation_mode = simulation
+
                     self.plc.ip = comm.get("plc_ip", "192.168.250.1")
+                    self.plc.port = int(comm.get("plc_port", self.plc.port))
+                    self.plc.pc_node = int(comm.get("pc_node", self.plc.pc_node))
+                    self.plc.plc_node = int(comm.get("plc_node", self.plc.plc_node))
+                    self.plc.simulation_mode = simulation
+
+                    self.labjack.simulation_mode = simulation
                     self.labjack_duration = float(comm.get("labjack_duration", 1.0))
-            except Exception:
-                pass
+
+                    plc_dm = data.get("plc_dm_addresses", {})
+                    self.plc_ctrl_addr = int(plc_dm.get("ctrl_addr", self.plc_ctrl_addr))
+                    self.plc_res_addr = int(plc_dm.get("res_addr", self.plc_res_addr))
+
+                    compensation = data.get("compensation", {})
+                    self.lcr.set_compensation(
+                        compensation.get("lcr_comp_r", 0.0),
+                        compensation.get("lcr_comp_l", 0.0)
+                    )
+            except Exception as e:
+                print(f"⚠️ 加载 config/config.json 失败: {e}")
 
     def refresh_hardware_status(self):
         self.load_settings()
@@ -328,13 +383,11 @@ class MotorTestApp:
                     self.lcr.is_connected = False
             if not getattr(self.lcr, 'is_connected', False): self.lcr.connect()
 
-        if not getattr(self.hioki, 'is_connected', False):
-            if hasattr(self.hioki, 'client') and self.hioki.client:
-                try:
-                    self.hioki.client.getpeername()
-                except OSError:
-                    self.hioki.is_connected = False
-            if not getattr(self.hioki, 'is_connected', False): self.hioki.connect(self.hioki.ip)
+        if hasattr(self.hioki, 'client') and self.hioki.client:
+            try:
+                self.hioki.client.getpeername()
+            except OSError:
+                self.hioki.close()
 
         if not getattr(self.labjack, 'is_connected', False):
             self.labjack.connect()
@@ -347,8 +400,9 @@ class MotorTestApp:
             self.ui.lbl_stat_lcr.setStyleSheet(
                 "color: green; font-weight: bold;" if self.lcr.is_connected else "color: gray;")
         if hasattr(self.ui, 'lbl_stat_hioki'):
+            hioki_online = self.hioki.is_connected or getattr(self.hioki, "last_comm_ok", False)
             self.ui.lbl_stat_hioki.setStyleSheet(
-                "color: green; font-weight: bold;" if self.hioki.is_connected else "color: gray;")
+                "color: green; font-weight: bold;" if hioki_online else "color: gray;")
         if hasattr(self.ui, 'lbl_stat_labjack'):
             self.ui.lbl_stat_labjack.setStyleSheet(
                 "color: green; font-weight: bold;" if self.labjack.is_connected else "color: gray;")
@@ -519,7 +573,7 @@ class MotorTestApp:
         self.ui.table_data.scrollToItem(self.ui.table_data.item(row_idx, 0))
 
     def build_csv_row_map(self, result_dict, sn_to_save):
-        chk_lcr_active = result_dict["R_raw"] != 0.0 or result_dict["L_raw"] != 0.0
+        chk_lcr_active = result_dict["RL"]["val"] != "未测试"
         chk_hioki_active = result_dict["Hioki"]["val"] != "未测试"
         chk_lj_active = result_dict["U"]["val"] != "未测试"
 
