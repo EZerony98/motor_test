@@ -87,7 +87,7 @@
           </font>
          </property>
          <property name="text">
-          <string>1. 电阻电感 (同惠）</string>
+          <string>1. 电阻电感 (Tonghui）</string>
          </property>
         </widget>
        </item>
@@ -141,6 +141,16 @@
         </spacer>
        </item>
        <item>
+        <widget class="QTextBrowser" name="text_log">
+         <property name="minimumSize">
+          <size>
+           <width>0</width>
+           <height>150</height>
+          </size>
+         </property>
+        </widget>
+       </item>
+       <item>
         <widget class="QLabel" name="label_3">
          <property name="sizePolicy">
           <sizepolicy hsizetype="Ignored" vsizetype="Expanding">
@@ -151,7 +161,7 @@
          <property name="minimumSize">
           <size>
            <width>0</width>
-           <height>120</height>
+           <height>110</height>
           </size>
          </property>
          <property name="maximumSize">

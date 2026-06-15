@@ -20,7 +20,8 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QGridLayout,
     QGroupBox, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QMainWindow, QMenu, QMenuBar,
     QPushButton, QSizePolicy, QSpacerItem, QStatusBar,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+    QTableWidget, QTableWidgetItem, QTextBrowser, QVBoxLayout,
+    QWidget)
 
 from pyqtgraph import PlotWidget
 
@@ -117,6 +118,12 @@ class Ui_MainWindow(object):
 
         self.verticalLayout.addItem(self.verticalSpacer)
 
+        self.text_log = QTextBrowser(self.groupBox)
+        self.text_log.setObjectName(u"text_log")
+        self.text_log.setMinimumSize(QSize(0, 150))
+
+        self.verticalLayout.addWidget(self.text_log)
+
         self.label_3 = QLabel(self.groupBox)
         self.label_3.setObjectName(u"label_3")
         sizePolicy1 = QSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
@@ -124,7 +131,7 @@ class Ui_MainWindow(object):
         sizePolicy1.setVerticalStretch(0)
         sizePolicy1.setHeightForWidth(self.label_3.sizePolicy().hasHeightForWidth())
         self.label_3.setSizePolicy(sizePolicy1)
-        self.label_3.setMinimumSize(QSize(0, 120))
+        self.label_3.setMinimumSize(QSize(0, 110))
         self.label_3.setMaximumSize(QSize(16777215, 150))
         self.label_3.setPixmap(QPixmap(u"../../Desktop/LOGO.png"))
         self.label_3.setScaledContents(True)

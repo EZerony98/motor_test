@@ -12,19 +12,26 @@ class OmronFinsPlcDriver:
         self.timeout = timeout
         self.is_connected = False
         self.simulation_mode = False
+        self.ping_address = 3500
+        self._sim_words = {}
 
     def ping(self):
-        """利用读取 D0 寄存器来测试 PLC 是否在线"""
+        """利用读取配置的 DM 寄存器来测试 PLC 是否在线"""
         if self.simulation_mode:
             self.is_connected = True
             return True
-        data, msg = self.read_dm(0, 1)
+        data, msg = self.read_dm(self.ping_address, 1)
         self.is_connected = (data is not None)
         return self.is_connected
 
     def read_dm(self, dm_address, num_elements=1):
         """读取 DM 区数据"""
-        if self.simulation_mode: return b'\x00\x00', "仿真模式"
+        if self.simulation_mode:
+            payload = b''
+            for offset in range(num_elements):
+                value = self._sim_words.get(dm_address + offset, 0)
+                payload += value.to_bytes(2, 'big', signed=False)
+            return payload, "仿真模式"
 
         ic, rsv, gct, dna = b'\x80', b'\x00', b'\x02', b'\x00'
         da1 = self.plc_node.to_bytes(1, 'big')
@@ -57,7 +64,10 @@ class OmronFinsPlcDriver:
 
     def write_dm_int16(self, dm_address, values_to_write):
         """写入 16位整数 (INT16) 到 DM 区"""
-        if self.simulation_mode: return True, "仿真模式"
+        if self.simulation_mode:
+            for offset, val in enumerate(values_to_write):
+                self._sim_words[dm_address + offset] = int(val) & 0xFFFF
+            return True, "仿真模式"
 
         ic, rsv, gct, dna = b'\x80', b'\x00', b'\x02', b'\x00'
         da1 = self.plc_node.to_bytes(1, 'big')
@@ -135,24 +145,79 @@ class OmronFinsPlcDriver:
 
     def write_dm_bit(self, dm_address, bit_index, bit_value):
         """读-改-写 (Read-Modify-Write) 机制修改单 Bit"""
+        self._validate_bit_index(bit_index)
+        bit_index = int(bit_index)
         read_data, msg = self.read_dm(dm_address, 1)
         if not read_data or len(read_data) != 2:
             return False, f"读取底层状态失败: {msg}"
 
-        current_val = int.from_bytes(read_data, byteorder='big', signed=False)
+        current_val = self.bytes_to_uint16(read_data)
         if bit_value:
             new_val = current_val | (1 << bit_index)
         else:
             new_val = current_val & ~(1 << bit_index)
 
-        if new_val > 32767:
-            new_val -= 65536
+        return self.write_dm_int16(dm_address, [self.uint16_to_int16(new_val)])
 
-        return self.write_dm_int16(dm_address, [new_val])
+    def write_dm_bits(self, dm_address, bit_values):
+        """一次读改写多个 Bit，减少同一个 DM 字的写入次数"""
+        read_data, msg = self.read_dm(dm_address, 1)
+        if not read_data or len(read_data) != 2:
+            return False, f"读取底层状态失败: {msg}"
+
+        new_val = self.bytes_to_uint16(read_data)
+        for bit_index, bit_value in bit_values.items():
+            self._validate_bit_index(bit_index)
+            bit_index = int(bit_index)
+            if bit_value:
+                new_val |= (1 << bit_index)
+            else:
+                new_val &= ~(1 << bit_index)
+
+        return self.write_dm_int16(dm_address, [self.uint16_to_int16(new_val)])
+
+    def read_dm_bit(self, dm_address, bit_index):
+        """读取 DM 字中的单个 Bit，返回 (bool_or_None, msg)"""
+        self._validate_bit_index(bit_index)
+        bit_index = int(bit_index)
+        data, msg = self.read_dm(dm_address, 1)
+        if not data or len(data) < 2:
+            return None, msg
+        word = self.bytes_to_uint16(data[:2])
+        return bool(word & (1 << bit_index)), msg
+
+    def read_dm_bits(self, dm_address, bit_map):
+        """批量读取 DM 字中的 Bit，bit_map 形如 {'ready': 3}"""
+        data, msg = self.read_dm(dm_address, 1)
+        if not data or len(data) < 2:
+            return None, msg
+        word = self.bytes_to_uint16(data[:2])
+        values = {}
+        for name, bit_index in bit_map.items():
+            self._validate_bit_index(bit_index)
+            bit_index = int(bit_index)
+            values[name] = bool(word & (1 << bit_index))
+        return values, msg
+
+    @staticmethod
+    def _validate_bit_index(bit_index):
+        if not 0 <= int(bit_index) <= 15:
+            raise ValueError(f"DM bit index must be 0-15, got {bit_index}")
 
     @staticmethod
     def bytes_to_int16(data):
         return int.from_bytes(data, 'big', signed=True)
+
+    @staticmethod
+    def bytes_to_uint16(data):
+        return int.from_bytes(data, 'big', signed=False)
+
+    @staticmethod
+    def uint16_to_int16(value):
+        value = int(value) & 0xFFFF
+        if value > 32767:
+            return value - 65536
+        return value
 
     @staticmethod
     def bytes_to_float32(data):

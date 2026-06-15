@@ -1,7 +1,7 @@
 {
     "communication": {
         "lcr_port": "/dev/cu.PL2303G-USBtoUART1240",
-        "hioki_ip": "192.168.10.5",
+        "hioki_ip": "192.168.250.5",
         "hioki_port": 6866,
         "hioki_use_table_command": true,
         "hioki_remote_before_start": true,
@@ -13,9 +13,44 @@
         "simulation": false,
         "labjack_duration": 1.0
     },
+    "plc_control": {
+        "done_delay_sec": 2.0,
+        "left_servo_speed_addrs": [3800],
+        "left_servo_speed_type": "float32",
+        "left_servo_speed_value": 2888.0,
+        "pc_stop_addr": 4000,
+        "pc_stop_value": 1,
+        "pc_stop_idle_value": 0
+    },
     "plc_dm_addresses": {
-        "ctrl_addr": 100,
-        "res_addr": 101
+        "word_addr": 3500,
+        "poll_interval_sec": 0.2,
+        "sequence": ["lcr", "hioki", "labjack"],
+        "heartbeat": {
+            "enabled": false,
+            "plc_to_pc_bit": 0,
+            "pc_to_plc_bit": 0
+        },
+        "signals": {
+            "lcr": {
+                "name": "电阻电感",
+                "ready_bit": 3,
+                "start_bit": 1,
+                "done_bit": 4
+            },
+            "hioki": {
+                "name": "匝间",
+                "ready_bit": 3,
+                "start_bit": 6,
+                "done_bit": 4
+            },
+            "labjack": {
+                "name": "反电势",
+                "ready_bit": 3,
+                "start_bit": 5,
+                "done_bit": 4
+            }
+        }
     },
     "compensation": {
         "lcr_comp_r": 0.0,

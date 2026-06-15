@@ -8,7 +8,7 @@ import numpy as np
 
 import pyqtgraph as pg
 from PySide6.QtWidgets import QApplication, QTableWidgetItem, QMessageBox, QDialog, QVBoxLayout
-from PySide6.QtCore import QThread, Signal, QFile, Qt
+from PySide6.QtCore import QThread, Signal, QFile, Qt, QObject, QTimer
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtGui import QColor
 
@@ -38,12 +38,50 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("通讯端口配置")
 
 
+class UiLogEmitter(QObject):
+    message_signal = Signal(str)
+
+
+class StreamToUiLog:
+    def __init__(self, emitter, original_stream=None):
+        self.emitter = emitter
+        self.original_stream = original_stream
+        self._buffer = ""
+
+    def write(self, text):
+        if self.original_stream:
+            self.original_stream.write(text)
+            self.original_stream.flush()
+
+        if not text:
+            return
+
+        self._buffer += str(text)
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            line = line.rstrip()
+            if line:
+                self.emitter.message_signal.emit(line)
+
+    def flush(self):
+        if self.original_stream:
+            self.original_stream.flush()
+
+    @property
+    def encoding(self):
+        return getattr(self.original_stream, "encoding", "utf-8")
+
+    def isatty(self):
+        return bool(getattr(self.original_stream, "isatty", lambda: False)())
+
+
 # ==========================================
 #   核心测试线程
 # ==========================================
 class TestThread(QThread):
     finished_signal = Signal(dict)
     wave_render_signal = Signal(tuple)
+    task_finished_signal = Signal(str)
 
     def __init__(self, lcr, hioki, labjack, sn, tasks, model_name, labjack_duration=1.0):
         super().__init__()
@@ -97,6 +135,7 @@ class TestThread(QThread):
                 result["RL"] = {"val": "通讯异常", "pass": False}
                 result["is_pass"] = False
                 self.lcr.is_connected = False
+            self.task_finished_signal.emit('lcr')
 
         # 2. 静态匝间
         if self.tasks.get('hioki'):
@@ -109,6 +148,7 @@ class TestThread(QThread):
                         result["Hioki"] = {"val": "切表失败", "pass": False, "raw": 0.0}
                         result["is_pass"] = False
                         self.hioki.is_connected = False
+                        self.task_finished_signal.emit('hioki')
                         self.finished_signal.emit(result)
                         return
                     time.sleep(0.8)
@@ -132,6 +172,7 @@ class TestThread(QThread):
                 result["Hioki"] = {"val": f"通讯异常: {e}", "pass": False, "raw": 0.0}
                 result["is_pass"] = False
                 self.hioki.is_connected = False
+            self.task_finished_signal.emit('hioki')
 
         # 3. 动态反电势
         if self.tasks.get('labjack'):
@@ -175,6 +216,7 @@ class TestThread(QThread):
                     result["Phase"]["pass"] = False
                     result["BEMF"]["pass"] = False
                     result["is_pass"] = False
+            self.task_finished_signal.emit('labjack')
 
         self.finished_signal.emit(result)
 
@@ -184,28 +226,107 @@ class TestThread(QThread):
 # ==========================================
 class AutoTestThread(QThread):
     log_signal = Signal(str)
-    trigger_test_signal = Signal()
+    trigger_test_signal = Signal(str)
 
-    def __init__(self, plc, ctrl_addr=100, res_addr=101):
+    def __init__(self, plc, plc_dm_config, task_order, task_index=0):
         super().__init__()
         self.plc = plc
+        self.plc_dm_config = plc_dm_config
+        self.task_order = task_order
+        self.task_index = task_index
         self.is_running = True
-        self.ctrl_addr = ctrl_addr
-        self.res_addr = res_addr
+        self.word_addr = int(plc_dm_config.get("word_addr", 3500))
+        self.poll_interval = float(plc_dm_config.get("poll_interval_sec", 0.2))
 
     def run(self):
-        self.log_signal.emit("进入全自动模式...")
+        if self.task_index >= len(self.task_order):
+            return
+
+        if not self.plc.is_connected:
+            self.log_signal.emit("PLC 未连接，等待已停止")
+            return
+
+        if self.task_index > 0:
+            prev_task = self.task_order[self.task_index - 1]
+            if not self.wait_previous_ready_clear(prev_task):
+                return
+            self.clear_task_bits(prev_task)
+
+        task_name = self.task_order[self.task_index]
+        task_cfg = self.get_task_config(task_name)
+        if not task_cfg:
+            self.log_signal.emit(f"PLC 配置中找不到任务: {task_name}")
+            return
+
+        ready_bit = int(task_cfg["ready_bit"])
+        start_bit = int(task_cfg["start_bit"])
+        label = task_cfg.get("name", task_name)
+        ok, msg = self.set_task_bit(task_name, "start_bit", True)
+        if ok:
+            self.log_signal.emit(f"已发送 PLC {label} 开始信号: DM{self.word_addr}.{start_bit:02d}=1")
+        else:
+            self.log_signal.emit(f"发送 PLC {label} 开始信号失败: {msg}")
+        self.log_signal.emit(f"等待 PLC {label} 就绪: DM{self.word_addr}.{ready_bit:02d}")
+
+        last_read_log_at = 0
         while self.is_running:
-            if self.plc.is_connected:
-                data, msg = self.plc.read_dm(self.ctrl_addr, 1)
-                if data:
-                    if self.plc.bytes_to_int16(data) == 1:
-                        self.plc.write_dm_int16(self.res_addr, [3])
-                        self.plc.write_dm_int16(self.ctrl_addr, [0])
-                        self.trigger_test_signal.emit()
-                        self.is_running = False
-                        break
-            time.sleep(0.5)
+            ready, msg = self.plc.read_dm_bit(self.word_addr, ready_bit)
+            if ready is None:
+                self.log_signal.emit(f"读取 PLC 就绪位失败: {msg}")
+            elif ready:
+                self.log_signal.emit(f"读取 PLC {label} 就绪位: DM{self.word_addr}.{ready_bit:02d}=1")
+                self.log_signal.emit(f"PLC {label} 已就绪，开始上位机采集")
+                self.trigger_test_signal.emit(task_name)
+                self.is_running = False
+                break
+            else:
+                now = time.time()
+                if now - last_read_log_at >= 1.0:
+                    self.log_signal.emit(f"读取 PLC {label} 就绪位: DM{self.word_addr}.{ready_bit:02d}=0")
+                    last_read_log_at = now
+            time.sleep(self.poll_interval)
+
+    def get_task_config(self, task_name):
+        return self.plc_dm_config.get("signals", {}).get(task_name, {})
+
+    def set_task_bit(self, task_name, bit_key, bit_value):
+        task_cfg = self.get_task_config(task_name)
+        if bit_key not in task_cfg:
+            return False, f"{task_name} 未配置 {bit_key}"
+        bit_index = int(task_cfg[bit_key])
+        return self.plc.write_dm_bit(self.word_addr, bit_index, bit_value)
+
+    def clear_task_bits(self, task_name):
+        task_cfg = self.get_task_config(task_name)
+        bit_values = {}
+        for bit_key in ("start_bit", "done_bit"):
+            if bit_key in task_cfg:
+                bit_values[int(task_cfg[bit_key])] = False
+        if bit_values:
+            self.plc.write_dm_bits(self.word_addr, bit_values)
+
+    def wait_previous_ready_clear(self, task_name):
+        task_cfg = self.get_task_config(task_name)
+        if not task_cfg:
+            return True
+        ready_bit = int(task_cfg["ready_bit"])
+        label = task_cfg.get("name", task_name)
+        self.log_signal.emit(f"等待 PLC 释放 {label} 就绪位: DM{self.word_addr}.{ready_bit:02d}")
+        last_read_log_at = 0
+        while self.is_running:
+            ready, msg = self.plc.read_dm_bit(self.word_addr, ready_bit)
+            if ready is None:
+                self.log_signal.emit(f"读取 PLC 就绪位失败: {msg}")
+            elif not ready:
+                self.log_signal.emit(f"读取 PLC {label} 就绪位: DM{self.word_addr}.{ready_bit:02d}=0")
+                return True
+            else:
+                now = time.time()
+                if now - last_read_log_at >= 1.0:
+                    self.log_signal.emit(f"读取 PLC {label} 就绪位: DM{self.word_addr}.{ready_bit:02d}=1")
+                    last_read_log_at = now
+            time.sleep(self.poll_interval)
+        return False
 
     def stop(self):
         self.is_running = False
@@ -214,8 +335,9 @@ class AutoTestThread(QThread):
 # ==========================================
 #   主程序窗口
 # ==========================================
-class MotorTestApp:
+class MotorTestApp(QObject):
     def __init__(self):
+        super().__init__()
         self.stat_total = 0
         self.stat_pass = 0
         self.stat_fail = 0
@@ -231,8 +353,25 @@ class MotorTestApp:
         self.current_batch_file = os.path.join("data", "batches", f"batch_{self.current_batch_id}.csv")
         self.auto_thread = None
         self.is_auto_mode = False
-        self.plc_ctrl_addr = 100
-        self.plc_res_addr = 101
+        self.plc_dm_config = self.default_plc_dm_config()
+        self.auto_task_order = []
+        self.auto_task_index = 0
+        self.active_plc_task = None
+        self.plc_sequence_mode = None
+        self.manual_plc_tasks = []
+        self.manual_plc_done_pending_count = 0
+        self.plc_done_delay_sec = 2.0
+        self.plc_left_servo_speed_addrs = [3800, 3802, 3804]
+        self.plc_left_servo_speed_value = 3000.0
+        self.plc_left_servo_speed_type = "float32"
+        self.plc_pc_stop_addr = 4000
+        self.plc_pc_stop_value = 1
+        self.plc_pc_stop_idle_value = 0
+        self._stdout_original = sys.stdout
+        self._stderr_original = sys.stderr
+        self._stdout_proxy = None
+        self._stderr_proxy = None
+        self.log_emitter = None
 
         self.data_schema = {}
         self.load_data_schema()
@@ -243,6 +382,8 @@ class MotorTestApp:
         f.open(QFile.ReadOnly)
         self.ui = loader.load(f)
         f.close()
+
+        self.setup_log_window()
 
         # 8 列自适应布局
         if hasattr(self.ui, 'table_data'):
@@ -279,6 +420,30 @@ class MotorTestApp:
 
         self.refresh_hardware_status()
         self.ui.show()
+
+    def setup_log_window(self):
+        if not hasattr(self.ui, 'text_log'):
+            return
+
+        self.ui.text_log.setReadOnly(True)
+        self.ui.text_log.document().setMaximumBlockCount(500)
+        self.ui.text_log.clear()
+
+        self.log_emitter = UiLogEmitter()
+        self.log_emitter.message_signal.connect(self.append_log_message)
+        self._stdout_proxy = StreamToUiLog(self.log_emitter, self._stdout_original)
+        self._stderr_proxy = StreamToUiLog(self.log_emitter, self._stderr_original)
+        sys.stdout = self._stdout_proxy
+        sys.stderr = self._stderr_proxy
+        print("[UI] 日志窗口已启动")
+
+    def append_log_message(self, message):
+        if not hasattr(self.ui, 'text_log'):
+            return
+        timestamp = time.strftime("%H:%M:%S")
+        self.ui.text_log.append(f"[{timestamp}] {message}")
+        scrollbar = self.ui.text_log.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
     def load_data_schema(self):
         schema_path = "config/data_schema.json"
@@ -333,6 +498,51 @@ class MotorTestApp:
         self.text_phase.setPos(x_pos, self.y_max - y_range * 0.50)
         self.text_harmonics.setPos(x_pos, self.y_max - y_range * 0.64)
 
+    @staticmethod
+    def default_plc_dm_config():
+        return {
+            "word_addr": 3500,
+            "poll_interval_sec": 0.2,
+            "sequence": ["lcr", "hioki", "labjack"],
+            "heartbeat": {
+                "enabled": False,
+                "plc_to_pc_bit": 0,
+                "pc_to_plc_bit": 0
+            },
+            "signals": {
+                "lcr": {"name": "电阻电感", "ready_bit": 3, "start_bit": 1, "done_bit": 4},
+                "hioki": {"name": "匝间", "ready_bit": 8, "start_bit": 6, "done_bit": 9},
+                "labjack": {"name": "反电势", "ready_bit": 3, "start_bit": 5, "done_bit": 14}
+            }
+        }
+
+    def normalize_plc_dm_config(self, raw_config):
+        config = copy.deepcopy(self.default_plc_dm_config())
+        if not isinstance(raw_config, dict):
+            return config
+
+        for key in ("word_addr", "poll_interval_sec", "sequence"):
+            if key in raw_config:
+                config[key] = raw_config[key]
+
+        if isinstance(raw_config.get("heartbeat"), dict):
+            config["heartbeat"].update(raw_config["heartbeat"])
+
+        raw_signals = raw_config.get("signals", {})
+        if isinstance(raw_signals, dict):
+            for task_name, task_cfg in raw_signals.items():
+                if task_name not in config["signals"]:
+                    config["signals"][task_name] = {}
+                config["signals"][task_name].update(task_cfg)
+
+        config["word_addr"] = int(config["word_addr"])
+        config["poll_interval_sec"] = float(config["poll_interval_sec"])
+        config["sequence"] = [task for task in config["sequence"] if task in config["signals"]]
+        for task_cfg in config["signals"].values():
+            for bit_key in ("ready_bit", "start_bit", "done_bit"):
+                task_cfg[bit_key] = int(task_cfg[bit_key])
+        return config
+
     def load_settings(self):
         if os.path.exists("config/config.json"):
             try:
@@ -361,9 +571,36 @@ class MotorTestApp:
                     self.labjack.simulation_mode = simulation
                     self.labjack_duration = float(comm.get("labjack_duration", 1.0))
 
-                    plc_dm = data.get("plc_dm_addresses", {})
-                    self.plc_ctrl_addr = int(plc_dm.get("ctrl_addr", self.plc_ctrl_addr))
-                    self.plc_res_addr = int(plc_dm.get("res_addr", self.plc_res_addr))
+                    self.plc_dm_config = self.normalize_plc_dm_config(data.get("plc_dm_addresses", {}))
+                    self.plc.ping_address = self.plc_dm_config["word_addr"]
+
+                    plc_control = data.get("plc_control", {})
+                    self.plc_done_delay_sec = float(
+                        plc_control.get("done_delay_sec", comm.get("plc_done_delay_sec", self.plc_done_delay_sec))
+                    )
+                    speed_addrs = plc_control.get("left_servo_speed_addrs")
+                    if speed_addrs is None:
+                        speed_addrs = [plc_control.get("left_servo_speed_addr", self.plc_left_servo_speed_addrs[0])]
+                    self.plc_left_servo_speed_addrs = [int(addr) for addr in speed_addrs]
+                    self.plc_left_servo_speed_value = float(
+                        plc_control.get(
+                            "left_servo_speed_value",
+                            plc_control.get("left_servo_speed_rpm", self.plc_left_servo_speed_value)
+                        )
+                    )
+                    self.plc_left_servo_speed_type = plc_control.get(
+                        "left_servo_speed_type",
+                        self.plc_left_servo_speed_type
+                    )
+                    self.plc_pc_stop_addr = int(
+                        plc_control.get("pc_stop_addr", self.plc_pc_stop_addr)
+                    )
+                    self.plc_pc_stop_value = int(
+                        plc_control.get("pc_stop_value", self.plc_pc_stop_value)
+                    )
+                    self.plc_pc_stop_idle_value = int(
+                        plc_control.get("pc_stop_idle_value", self.plc_pc_stop_idle_value)
+                    )
 
                     compensation = data.get("compensation", {})
                     self.lcr.set_compensation(
@@ -388,6 +625,8 @@ class MotorTestApp:
                 self.hioki.client.getpeername()
             except OSError:
                 self.hioki.close()
+        if not getattr(self.hioki, 'is_connected', False):
+            self.hioki.connect(self.hioki.ip)
 
         if not getattr(self.labjack, 'is_connected', False):
             self.labjack.connect()
@@ -410,29 +649,273 @@ class MotorTestApp:
             self.ui.lbl_stat_plc.setStyleSheet(
                 "color: green; font-weight: bold;" if self.plc.is_connected else "color: gray;")
 
-    def on_start(self):
-        self.is_auto_mode = hasattr(self.ui, 'chk_auto') and self.ui.chk_auto.isChecked()
-        if self.is_auto_mode:
-            if self.auto_thread is None or not self.auto_thread.isRunning():
-                self.auto_thread = AutoTestThread(self.plc, ctrl_addr=self.plc_ctrl_addr, res_addr=self.plc_res_addr)
-                self.auto_thread.log_signal.connect(self.log_message)
-                self.auto_thread.trigger_test_signal.connect(self.execute_hardware_test)
-                self.auto_thread.start()
-            if hasattr(self.ui, 'lbl_status'):
-                self.ui.lbl_status.setText("AUTO WAITING...")
-                self.ui.lbl_status.setStyleSheet("background-color: lightblue; color: black;")
-            return
-        self.execute_hardware_test()
-
-    def log_message(self, msg):
-        print(f"[AUTO] {msg}")
-
-    def execute_hardware_test(self):
+    def get_selected_tasks(self, default_all=False):
         tasks = {
             'lcr': self.ui.chk_lcr.isChecked() if hasattr(self.ui, 'chk_lcr') else False,
             'hioki': self.ui.chk_hioki.isChecked() if hasattr(self.ui, 'chk_hioki') else False,
             'labjack': self.ui.chk_labjack.isChecked() if hasattr(self.ui, 'chk_labjack') else False
         }
+        if default_all and not any(tasks.values()):
+            tasks = {task: True for task in tasks}
+        return tasks
+
+    def get_plc_task_label(self, task_name):
+        return self.plc_dm_config.get("signals", {}).get(task_name, {}).get("name", task_name)
+
+    def write_plc_word(self, dm_address, value, label):
+        if not self.plc.is_connected:
+            self.log_message(f"PLC 未连接，未写入 {label}")
+            return False
+
+        ok, msg = self.plc.write_dm_int16(int(dm_address), [int(value)])
+        if ok:
+            self.log_message(f"已写入 PLC {label}: D{int(dm_address)}={int(value)}")
+        else:
+            self.log_message(f"写入 PLC {label} 失败: {msg}")
+        return ok
+
+    def write_plc_float(self, dm_address, value, label):
+        if not self.plc.is_connected:
+            self.log_message(f"PLC 未连接，未写入 {label}")
+            return False
+
+        ok, msg = self.plc.write_dm_float(int(dm_address), [float(value)])
+        if ok:
+            self.log_message(f"已写入 PLC {label}: D{int(dm_address)}=REAL {float(value):.1f}")
+        else:
+            self.log_message(f"写入 PLC {label} 失败: {msg}")
+        return ok
+
+    def write_plc_left_servo_speed(self):
+        ok_all = True
+        for dm_address in self.plc_left_servo_speed_addrs:
+            label = f"左伺服电机转速({self.plc_left_servo_speed_type})"
+            if self.plc_left_servo_speed_type.lower() in ("float", "float32", "real"):
+                ok = self.write_plc_float(dm_address, self.plc_left_servo_speed_value, label)
+            else:
+                ok = self.write_plc_word(dm_address, int(self.plc_left_servo_speed_value), label)
+            ok_all = ok_all and ok
+        return ok_all
+
+    def clear_plc_stop_signal(self):
+        return self.write_plc_word(
+            self.plc_pc_stop_addr,
+            self.plc_pc_stop_idle_value,
+            "停止/复位信号复位"
+        )
+
+    def write_plc_stop_signal(self):
+        return self.write_plc_word(
+            self.plc_pc_stop_addr,
+            self.plc_pc_stop_value,
+            "停止/复位信号"
+        )
+
+    def clear_plc_task_bits(self, task_names=None):
+        if not self.plc.is_connected:
+            return
+        word_addr = int(self.plc_dm_config.get("word_addr", 3500))
+        signals = self.plc_dm_config.get("signals", {})
+        if task_names is None:
+            task_names = signals.keys()
+        bit_values = {}
+        for task_name in task_names:
+            task_cfg = signals.get(task_name, {})
+            for bit_key in ("start_bit", "done_bit"):
+                if bit_key in task_cfg:
+                    bit_values[int(task_cfg[bit_key])] = False
+        if bit_values:
+            ok, msg = self.plc.write_dm_bits(word_addr, bit_values)
+            if not ok:
+                self.log_message(f"清除 PLC 位失败: {msg}")
+
+    def get_plc_task_names_from_flags(self, tasks):
+        sequence = self.plc_dm_config.get("sequence", ["lcr", "hioki", "labjack"])
+        return [task_name for task_name in sequence if tasks.get(task_name)]
+
+    def write_manual_plc_start_bits(self, task_names):
+        if not task_names:
+            return
+        if not self.plc.is_connected:
+            self.log_message("PLC 未连接，手动测试未发送开始信号")
+            return
+
+        word_addr = int(self.plc_dm_config.get("word_addr", 3500))
+        signals = self.plc_dm_config.get("signals", {})
+        bit_values = {}
+        labels = []
+        for task_name in task_names:
+            task_cfg = signals.get(task_name, {})
+            if "done_bit" in task_cfg:
+                bit_values[int(task_cfg["done_bit"])] = False
+            if "start_bit" in task_cfg:
+                bit_values[int(task_cfg["start_bit"])] = True
+                labels.append(self.get_plc_task_label(task_name))
+
+        if not bit_values:
+            return
+
+        ok, msg = self.plc.write_dm_bits(word_addr, bit_values)
+        if ok:
+            self.log_message(f"手动测试已发送 PLC 开始信号: {', '.join(labels)}")
+        else:
+            self.log_message(f"手动测试发送 PLC 开始信号失败: {msg}")
+
+    def write_manual_plc_done_bits(self, task_names):
+        if not task_names:
+            return
+        if not self.plc.is_connected:
+            self.log_message("PLC 未连接，手动测试未发送完成信号")
+            return
+
+        word_addr = int(self.plc_dm_config.get("word_addr", 3500))
+        signals = self.plc_dm_config.get("signals", {})
+        bit_values = {}
+        labels = []
+        for task_name in task_names:
+            task_cfg = signals.get(task_name, {})
+            if "start_bit" in task_cfg:
+                bit_values[int(task_cfg["start_bit"])] = False
+            if "done_bit" in task_cfg:
+                bit_values[int(task_cfg["done_bit"])] = True
+                labels.append(self.get_plc_task_label(task_name))
+
+        if not bit_values:
+            return
+
+        ok, msg = self.plc.write_dm_bits(word_addr, bit_values)
+        if ok:
+            self.log_message(f"手动测试已发送 PLC 完成信号: {', '.join(labels)}")
+        else:
+            self.log_message(f"手动测试发送 PLC 完成信号失败: {msg}")
+
+    def schedule_plc_done_signal(self, label, callback):
+        delay_ms = max(0, int(self.plc_done_delay_sec * 1000))
+        if delay_ms == 0:
+            callback()
+            return
+        self.log_message(f"{label} 测试结束，{self.plc_done_delay_sec:.1f} 秒后发送 PLC 完成信号")
+        QTimer.singleShot(delay_ms, callback)
+
+    def schedule_manual_plc_done_bits(self, task_names):
+        task_names = list(task_names)
+        label = ", ".join(self.get_plc_task_label(task_name) for task_name in task_names)
+
+        def send_done():
+            self.write_manual_plc_done_bits(task_names)
+            self.manual_plc_done_pending_count = max(0, self.manual_plc_done_pending_count - len(task_names))
+            if not self.is_auto_mode and self.manual_plc_done_pending_count == 0 and hasattr(self.ui, 'btn_start'):
+                self.ui.btn_start.setEnabled(True)
+
+        self.schedule_plc_done_signal(label or "手动", send_done)
+
+    def on_manual_task_finished(self, task_name):
+        if self.is_auto_mode or task_name not in self.manual_plc_tasks:
+            return
+        self.manual_plc_tasks = [task for task in self.manual_plc_tasks if task != task_name]
+        self.schedule_manual_plc_done_bits([task_name])
+
+    def schedule_auto_plc_done_bit(self, task_name):
+        label = self.get_plc_task_label(task_name)
+
+        def send_done():
+            if not self.plc_sequence_mode or self.active_plc_task != task_name:
+                return
+            self.mark_plc_task_finished(task_name)
+            self.auto_task_index += 1
+            self.active_plc_task = None
+            self.start_auto_wait_thread()
+
+        self.schedule_plc_done_signal(label, send_done)
+
+    def start_auto_wait_thread(self):
+        if self.auto_thread and self.auto_thread.isRunning():
+            self.auto_thread.stop()
+            self.auto_thread.wait(1000)
+
+        if self.auto_task_index >= len(self.auto_task_order):
+            finished_mode = self.plc_sequence_mode
+            self.plc_sequence_mode = None
+            self.active_plc_task = None
+            if hasattr(self.ui, 'btn_start'): self.ui.btn_start.setEnabled(True)
+            if finished_mode == "auto" and hasattr(self.ui, 'lbl_status'):
+                self.ui.lbl_status.setText("AUTO DONE")
+                self.ui.lbl_status.setStyleSheet("background-color: green; color: white;")
+            elif finished_mode == "manual":
+                self.log_message("手动 PLC 流程完成")
+            return
+
+        self.auto_thread = AutoTestThread(
+            self.plc,
+            self.plc_dm_config,
+            self.auto_task_order,
+            self.auto_task_index
+        )
+        self.auto_thread.log_signal.connect(self.log_message)
+        self.auto_thread.trigger_test_signal.connect(self.execute_plc_task)
+        self.auto_thread.start()
+
+        task_name = self.auto_task_order[self.auto_task_index]
+        if hasattr(self.ui, 'lbl_status'):
+            self.ui.lbl_status.setText(f"WAIT PLC {self.get_plc_task_label(task_name)}")
+            self.ui.lbl_status.setStyleSheet("background-color: lightblue; color: black;")
+        mode_label = "自动模式" if self.plc_sequence_mode == "auto" else "手动模式"
+        self.log_message(f"{mode_label}等待步骤 {self.auto_task_index + 1}/{len(self.auto_task_order)}: {self.get_plc_task_label(task_name)}")
+
+    def execute_plc_task(self, task_name):
+        self.active_plc_task = task_name
+        tasks = {'lcr': False, 'hioki': False, 'labjack': False}
+        tasks[task_name] = True
+        self.execute_hardware_test(forced_tasks=tasks)
+
+    def mark_plc_task_finished(self, task_name):
+        task_cfg = self.plc_dm_config.get("signals", {}).get(task_name, {})
+        if not task_cfg or not self.plc.is_connected:
+            return
+
+        word_addr = int(self.plc_dm_config.get("word_addr", 3500))
+        done_bit = int(task_cfg["done_bit"])
+        ok, msg = self.plc.write_dm_bit(word_addr, done_bit, True)
+        if ok:
+            self.log_message(f"已写入 PLC {self.get_plc_task_label(task_name)} 完成位: DM{word_addr}.{done_bit:02d}")
+        else:
+            self.log_message(f"写入 PLC 完成位失败: {msg}")
+
+    def on_start(self):
+        self.is_auto_mode = hasattr(self.ui, 'chk_auto') and self.ui.chk_auto.isChecked()
+        self.refresh_hardware_status()
+        if not self.plc.is_connected:
+            QMessageBox.warning(self.ui, "提示", "PLC 未连接，请先检查网线、IP、FINS节点和端口。")
+            return
+
+        selected_tasks = self.get_selected_tasks(default_all=self.is_auto_mode)
+        sequence = self.plc_dm_config.get("sequence", ["lcr", "hioki", "labjack"])
+        self.auto_task_order = [task for task in sequence if selected_tasks.get(task)]
+        if not self.auto_task_order:
+            QMessageBox.warning(self.ui, "提示", "请至少勾选一个测试项目！")
+            return
+
+        if not self.clear_plc_stop_signal():
+            QMessageBox.warning(self.ui, "提示", "PLC 停止/复位信号复位失败，请检查 PLC 通讯。")
+            return
+        if not self.write_plc_left_servo_speed():
+            QMessageBox.warning(self.ui, "提示", "左伺服电机转速写入失败，请检查 PLC 通讯。")
+            return
+
+        self.plc_sequence_mode = "auto" if self.is_auto_mode else "manual"
+        self.auto_task_index = 0
+        self.active_plc_task = None
+        self.manual_plc_tasks = []
+        self.manual_plc_done_pending_count = 0
+        self.clear_plc_task_bits(self.auto_task_order)
+        if hasattr(self.ui, 'btn_start'): self.ui.btn_start.setEnabled(False)
+        self.start_auto_wait_thread()
+
+    def log_message(self, msg):
+        print(f"[PLC] {msg}")
+
+    def execute_hardware_test(self, forced_tasks=None):
+        tasks = forced_tasks if forced_tasks is not None else self.get_selected_tasks()
         if not any(tasks.values()):
             QMessageBox.warning(self.ui, "提示", "请至少勾选一个测试项目！")
             return
@@ -442,15 +925,34 @@ class MotorTestApp:
 
         self.current_sn = sn
         current_model = self.ui.combo_model.currentText() if hasattr(self.ui, 'combo_model') else ""
+        task_labels = []
+        if tasks.get('lcr'):
+            task_labels.append("电阻电感")
+        if tasks.get('hioki'):
+            task_labels.append("匝间")
+        if tasks.get('labjack'):
+            task_labels.append("反电势")
+        print(f"[TEST] 开始测试 SN={sn} 型号={current_model} 项目={','.join(task_labels)}")
         self.refresh_hardware_status()
+        if not self.is_auto_mode and forced_tasks is None:
+            self.manual_plc_tasks = self.get_plc_task_names_from_flags(tasks)
+            self.manual_plc_done_pending_count = len(self.manual_plc_tasks) if self.plc.is_connected else 0
+            self.write_manual_plc_start_bits(self.manual_plc_tasks)
+            if not self.plc.is_connected:
+                self.manual_plc_tasks = []
 
         if hasattr(self.ui, 'btn_start'): self.ui.btn_start.setEnabled(False)
         if hasattr(self.ui, 'lbl_status'):
-            self.ui.lbl_status.setText("TESTING...")
+            if self.is_auto_mode and self.active_plc_task:
+                self.ui.lbl_status.setText(f"TESTING {self.get_plc_task_label(self.active_plc_task)}")
+            else:
+                self.ui.lbl_status.setText("TESTING...")
             self.ui.lbl_status.setStyleSheet("background-color: yellow; color: black;")
 
         self.worker = TestThread(self.lcr, self.hioki, self.labjack, sn, tasks, current_model, self.labjack_duration)
         self.worker.wave_render_signal.connect(self.render_captured_wave)
+        if not self.is_auto_mode and forced_tasks is None and self.manual_plc_tasks:
+            self.worker.task_finished_signal.connect(self.on_manual_task_finished)
         self.worker.finished_signal.connect(self.on_test_finished)
         self.worker.start()
 
@@ -697,7 +1199,8 @@ class MotorTestApp:
         finished_sn = result_dict.get("sn", self.current_sn)
         self.current_sn = finished_sn
 
-        if not self.is_auto_mode:
+        should_wait_manual_done = (not self.is_auto_mode and bool(self.plc_sequence_mode))
+        if not self.is_auto_mode and not should_wait_manual_done:
             if hasattr(self.ui, 'btn_start'): self.ui.btn_start.setEnabled(True)
 
         result_dict = self.merge_result_for_sn(finished_sn, result_dict)
@@ -712,6 +1215,7 @@ class MotorTestApp:
                 self.ui.lbl_status.setStyleSheet("background-color: red; color: white;")
                 self.stat_fail += 1
 
+        print(f"[TEST] 完成测试 SN={finished_sn} 结果={'PASS' if is_pass else 'FAIL'}")
         self.stat_total += 1
         self.update_stats()
         self.update_connection_ui()
@@ -725,11 +1229,9 @@ class MotorTestApp:
 
         self.upsert_result_table_row(finished_sn, result_dict)
 
-        if self.is_auto_mode and self.plc.is_connected:
-            result_code = 1 if is_pass else 2
-            self.plc.write_dm_int16(self.plc_res_addr, [result_code])
-            self.auto_thread.is_running = True
-            self.auto_thread.start()
+        if self.plc_sequence_mode and self.plc.is_connected and self.active_plc_task:
+            finished_task = self.active_plc_task
+            self.schedule_auto_plc_done_bit(finished_task)
 
     def update_stats(self):
         if hasattr(self.ui, 'lbl_total'): self.ui.lbl_total.setText(str(self.stat_total))
@@ -737,19 +1239,34 @@ class MotorTestApp:
         if hasattr(self.ui, 'lbl_fail'): self.ui.lbl_fail.setText(str(self.stat_fail))
 
     def on_stop(self):
-        QMessageBox.information(self.ui, "提示", "已重置并退出自动模式")
+        self.load_settings()
+        if not self.plc.is_connected:
+            self.plc.ping()
         self.is_auto_mode = False
         if self.auto_thread: self.auto_thread.stop()
+        self.clear_plc_task_bits(self.auto_task_order or None)
+        self.write_plc_stop_signal()
+        self.plc_sequence_mode = None
+        self.manual_plc_tasks = []
+        self.manual_plc_done_pending_count = 0
+        self.auto_task_order = []
+        self.auto_task_index = 0
+        self.active_plc_task = None
         if hasattr(self.ui, 'btn_start'): self.ui.btn_start.setEnabled(True)
         if hasattr(self.ui, 'lbl_status'):
             self.ui.lbl_status.setText("READY")
             self.ui.lbl_status.setStyleSheet("background-color: lightgray; color: black;")
+        QMessageBox.information(self.ui, "提示", "已重置并退出测试流程")
 
     def cleanup(self):
         if self.auto_thread: self.auto_thread.stop()
+        if self.plc_sequence_mode:
+            self.clear_plc_task_bits(self.auto_task_order or None)
         self.lcr.close() if hasattr(self.lcr, 'close') else None
         self.hioki.close() if hasattr(self.hioki, 'close') else None
         self.labjack.close() if hasattr(self.labjack, 'close') else None
+        sys.stdout = self._stdout_original
+        sys.stderr = self._stderr_original
 
 
 if __name__ == "__main__":
