@@ -20,7 +20,7 @@
         "left_servo_speed_value": 2888.0,
         "pc_stop_addr": 4000,
         "pc_stop_value": 1,
-        "pc_stop_idle_value": 0
+        "pc_stop_idle_value": 1
     },
     "plc_dm_addresses": {
         "word_addr": 3500,
@@ -36,13 +36,19 @@
                 "name": "电阻电感",
                 "ready_bit": 3,
                 "start_bit": 1,
-                "done_bit": 4
+                "done_bit": 4,
+                "position_done_bit": 8,
+                "sample_count": 3,
+                "position_switch_timeout_sec": 60.0
             },
             "hioki": {
                 "name": "匝间",
                 "ready_bit": 3,
                 "start_bit": 6,
-                "done_bit": 4
+                "done_bit": 4,
+                "position_done_bit": 8,
+                "sample_count": 3,
+                "position_switch_timeout_sec": 60.0
             },
             "labjack": {
                 "name": "反电势",

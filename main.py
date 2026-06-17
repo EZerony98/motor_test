@@ -82,18 +82,132 @@ class TestThread(QThread):
     finished_signal = Signal(dict)
     wave_render_signal = Signal(tuple)
     task_finished_signal = Signal(str)
+    log_signal = Signal(str)
 
-    def __init__(self, lcr, hioki, labjack, sn, tasks, model_name, labjack_duration=1.0):
+    def __init__(self, lcr, hioki, labjack, sn, tasks, model_name, labjack_duration=1.0, plc=None, plc_dm_config=None):
         super().__init__()
         self.lcr, self.hioki, self.labjack = lcr, hioki, labjack
         self.sn, self.tasks, self.model_name = sn, tasks, model_name
         self.labjack_duration = labjack_duration
+        self.plc = plc
+        self.plc_dm_config = plc_dm_config or {}
 
     @staticmethod
     def _range_from_specs(specs, range_key, min_key, max_key, default_min, default_max):
         if range_key in specs and isinstance(specs[range_key], (list, tuple)) and len(specs[range_key]) >= 2:
             return float(specs[range_key][0]), float(specs[range_key][1])
         return float(specs.get(min_key, default_min)), float(specs.get(max_key, default_max))
+
+    def get_task_config(self, task_name):
+        return self.plc_dm_config.get("signals", {}).get(task_name, {})
+
+    def get_task_label(self, task_name):
+        return self.get_task_config(task_name).get("name", task_name)
+
+    def get_task_sample_count(self, task_name):
+        task_cfg = self.get_task_config(task_name)
+        try:
+            return max(1, int(task_cfg.get("sample_count", 1)))
+        except (TypeError, ValueError):
+            return 1
+
+    def log(self, message):
+        self.log_signal.emit(message)
+
+    def wait_plc_bit(self, bit_index, expected_value, label, timeout_sec):
+        if not self.plc or not self.plc.is_connected:
+            self.log(f"PLC 未连接，无法等待 {label}")
+            return False
+
+        word_addr = int(self.plc_dm_config.get("word_addr", 3500))
+        poll_interval = float(self.plc_dm_config.get("poll_interval_sec", 0.2))
+        deadline = time.time() + timeout_sec if timeout_sec and timeout_sec > 0 else None
+        last_log_at = 0
+
+        while True:
+            value, msg = self.plc.read_dm_bit(word_addr, bit_index)
+            if value is not None and bool(value) == bool(expected_value):
+                self.log(f"PLC {label}: DM{word_addr}.{int(bit_index):02d}={int(bool(expected_value))}")
+                return True
+
+            now = time.time()
+            if deadline and now > deadline:
+                self.log(f"等待 PLC {label} 超时: {msg}")
+                return False
+
+            if now - last_log_at >= 1.0:
+                value_text = "?" if value is None else str(int(bool(value)))
+                self.log(f"等待 PLC {label}: DM{word_addr}.{int(bit_index):02d}={value_text}")
+                last_log_at = now
+            time.sleep(poll_interval)
+
+    def complete_position_sample(self, task_name, position_index, total_positions):
+        task_cfg = self.get_task_config(task_name)
+        if "position_done_bit" not in task_cfg:
+            return True
+        if not self.plc or not self.plc.is_connected:
+            self.log(f"PLC 未连接，未写入 {self.get_task_label(task_name)} 第 {position_index} 组位置完成位")
+            return False
+
+        word_addr = int(self.plc_dm_config.get("word_addr", 3500))
+        position_done_bit = int(task_cfg["position_done_bit"])
+        ok, msg = self.plc.write_dm_bit(word_addr, position_done_bit, True)
+        if ok:
+            self.log(
+                f"已写入 PLC {self.get_task_label(task_name)} 第 {position_index}/{total_positions} 组位置完成位: "
+                f"DM{word_addr}.{position_done_bit:02d}=1"
+            )
+        else:
+            self.log(f"写入 PLC 位置完成位失败: {msg}")
+            return False
+
+        if position_index >= total_positions:
+            return True
+
+        if getattr(self.plc, "simulation_mode", False):
+            self.plc.write_dm_bit(word_addr, position_done_bit, False)
+            self.log(f"仿真模式自动复位位置完成位: DM{word_addr}.{position_done_bit:02d}=0")
+            return True
+
+        timeout_sec = float(task_cfg.get("position_switch_timeout_sec", 60.0))
+        if not self.wait_plc_bit(position_done_bit, False, "读取位置完成位复位", timeout_sec):
+            return False
+
+        if "ready_bit" in task_cfg:
+            ready_bit = int(task_cfg["ready_bit"])
+            return self.wait_plc_bit(ready_bit, True, f"{self.get_task_label(task_name)} 下一位置就绪", timeout_sec)
+        return True
+
+    @staticmethod
+    def format_lcr_samples(samples, sample_count, r_min, r_max, l_min, l_max):
+        lines = []
+        for index in range(sample_count):
+            sample_no = index + 1
+            if index >= len(samples):
+                lines.append(f"{sample_no}: 未完成")
+                continue
+            sample = samples[index]
+            if sample.get("R") is None or sample.get("L") is None:
+                lines.append(f"{sample_no}: {sample.get('error', '通讯异常')}")
+            else:
+                lines.append(f"{sample_no}: R {sample['R']:.4f} mΩ / L {sample['L']:.4f} µH")
+        lines.append(f"R[{r_min}~{r_max}] L[{l_min}~{l_max}]")
+        return "\n".join(lines)
+
+    @staticmethod
+    def format_hioki_samples(samples, sample_count):
+        lines = []
+        for index in range(sample_count):
+            sample_no = index + 1
+            if index >= len(samples):
+                lines.append(f"{sample_no}: 未完成")
+                continue
+            sample = samples[index]
+            if sample.get("error"):
+                lines.append(f"{sample_no}: {sample['error']}")
+            else:
+                lines.append(f"{sample_no}: {sample.get('value', '')}")
+        return "\n".join(lines)
 
     def run(self):
         specs = SpecManager.get_specs(self.model_name) or {}
@@ -104,14 +218,15 @@ class TestThread(QThread):
 
         result = {
             "sn": self.sn,
-            "RL": {"val": "未测试", "pass": True},
-            "Hioki": {"val": "未测试", "pass": True, "raw": 0.0},
+            "RL": {"val": "未测试", "pass": True, "samples": []},
+            "Hioki": {"val": "未测试", "pass": True, "raw": 0.0, "samples": []},
             "U": {"val": "未测试", "pass": True},
             "V": {"val": "未测试", "pass": True},
             "W": {"val": "未测试", "pass": True},
             "Phase": {"val": "未测试", "pass": True, "raw_diffs": [0.0, 0.0, 0.0]},
             "is_pass": True,
             "R_raw": 0.0, "L_raw": 0.0,
+            "R_raws": [], "L_raws": [], "Hioki_raws": [],
             "BEMF": {
                 "pass": True,
                 "raw_peaks": [0.0, 0.0, 0.0],
@@ -122,56 +237,107 @@ class TestThread(QThread):
 
         # 1. 静态电阻电感
         if self.tasks.get('lcr'):
-            raw = self.lcr.fetch_data()
-            if raw:
-                r_ok = r_min <= raw['R'] <= r_max
-                l_ok = l_min <= raw['L'] <= l_max
-                rl_str = f"R: {raw['R']:.4f} mΩ\n[{r_min}~{r_max}]\nL: {raw['L']:.4f} µH\n[{l_min}~{l_max}]"
-                result["RL"] = {"val": rl_str, "pass": r_ok and l_ok}
-                result["R_raw"] = float(raw['R'])
-                result["L_raw"] = float(raw['L'])
-                if not (r_ok and l_ok): result["is_pass"] = False
-            else:
-                result["RL"] = {"val": "通讯异常", "pass": False}
+            lcr_sample_count = self.get_task_sample_count('lcr')
+            lcr_samples = []
+            for sample_index in range(1, lcr_sample_count + 1):
+                raw = self.lcr.fetch_data()
+                if raw:
+                    r_raw = float(raw['R'])
+                    l_raw = float(raw['L'])
+                    r_ok = r_min <= r_raw <= r_max
+                    l_ok = l_min <= l_raw <= l_max
+                    lcr_samples.append({"R": r_raw, "L": l_raw, "pass": r_ok and l_ok})
+                    if not (r_ok and l_ok):
+                        result["is_pass"] = False
+                else:
+                    lcr_samples.append({"R": None, "L": None, "pass": False, "error": "通讯异常"})
+                    result["is_pass"] = False
+                    self.lcr.is_connected = False
+
+                if not self.complete_position_sample('lcr', sample_index, lcr_sample_count):
+                    lcr_samples[-1]["pass"] = False
+                    if not lcr_samples[-1].get("error"):
+                        lcr_samples[-1]["error"] = "PLC切位失败"
+                    result["is_pass"] = False
+                    break
+
+            lcr_pass = len(lcr_samples) == lcr_sample_count and all(sample.get("pass") for sample in lcr_samples)
+            r_values = [sample.get("R") for sample in lcr_samples]
+            l_values = [sample.get("L") for sample in lcr_samples]
+            result["RL"] = {
+                "val": self.format_lcr_samples(lcr_samples, lcr_sample_count, r_min, r_max, l_min, l_max),
+                "pass": lcr_pass,
+                "samples": copy.deepcopy(lcr_samples)
+            }
+            result["R_raws"] = r_values
+            result["L_raws"] = l_values
+            first_r = next((value for value in r_values if value is not None), 0.0)
+            first_l = next((value for value in l_values if value is not None), 0.0)
+            result["R_raw"] = float(first_r)
+            result["L_raw"] = float(first_l)
+            if not lcr_pass:
                 result["is_pass"] = False
-                self.lcr.is_connected = False
             self.task_finished_signal.emit('lcr')
 
         # 2. 静态匝间
         if self.tasks.get('hioki'):
-            try:
-                table_id = specs.get('table_id', 1)
-                if hasattr(self.hioki, 'run_test'):
-                    res_h, data_dict = self.hioki.run_test(table_id)
-                else:
-                    if hasattr(self.hioki, 'switch_table') and not self.hioki.switch_table(table_id):
-                        result["Hioki"] = {"val": "切表失败", "pass": False, "raw": 0.0}
+            hioki_sample_count = self.get_task_sample_count('hioki')
+            hioki_samples = []
+            for sample_index in range(1, hioki_sample_count + 1):
+                try:
+                    table_id = specs.get('table_id', 1)
+                    if hasattr(self.hioki, 'run_test'):
+                        res_h, data_dict = self.hioki.run_test(table_id)
+                    else:
+                        if hasattr(self.hioki, 'switch_table') and not self.hioki.switch_table(table_id):
+                            hioki_samples.append({"value": "切表失败", "pass": False, "raw": None, "error": "切表失败"})
+                            result["is_pass"] = False
+                            self.hioki.is_connected = False
+                            if not self.complete_position_sample('hioki', sample_index, hioki_sample_count):
+                                hioki_samples[-1]["error"] = "PLC切位失败"
+                            break
+                        time.sleep(0.8)
+                        res_h, data_dict = self.hioki.get_data() if hasattr(self.hioki, 'get_data') else ("PASS", {})
+
+                    if res_h == "ERR":
+                        err_msg = data_dict.get("Error", "通讯异常") if isinstance(data_dict, dict) else "通讯异常"
+                        hioki_samples.append({"value": err_msg, "pass": False, "raw": None, "error": err_msg})
                         result["is_pass"] = False
                         self.hioki.is_connected = False
-                        self.task_finished_signal.emit('hioki')
-                        self.finished_signal.emit(result)
-                        return
-                    time.sleep(0.8)
-                    res_h, data_dict = self.hioki.get_data() if hasattr(self.hioki, 'get_data') else ("PASS", {})
-
-                if res_h == "ERR":
-                    err_msg = data_dict.get("Error", "通讯异常") if isinstance(data_dict, dict) else "通讯异常"
-                    result["Hioki"] = {"val": err_msg, "pass": False, "raw": 0.0}
+                    else:
+                        h_ok = (res_h == "PASS")
+                        area_val = data_dict.get('AREA', 0.0)
+                        try:
+                            area_raw = float(area_val)
+                        except (TypeError, ValueError):
+                            area_raw = None
+                        hioki_samples.append({"value": f"{area_val}", "pass": h_ok, "raw": area_raw})
+                        if not h_ok:
+                            result["is_pass"] = False
+                except Exception as e:
+                    hioki_samples.append({"value": f"通讯异常: {e}", "pass": False, "raw": None, "error": f"通讯异常: {e}"})
                     result["is_pass"] = False
                     self.hioki.is_connected = False
-                else:
-                    h_ok = (res_h == "PASS")
-                    area_val = data_dict.get('AREA', 0.0)
-                    try:
-                        area_raw = float(area_val)
-                    except (TypeError, ValueError):
-                        area_raw = 0.0
-                    result["Hioki"] = {"val": f"{area_val}", "pass": h_ok, "raw": area_raw}
-                    if not h_ok: result["is_pass"] = False
-            except Exception as e:
-                result["Hioki"] = {"val": f"通讯异常: {e}", "pass": False, "raw": 0.0}
+
+                if not self.complete_position_sample('hioki', sample_index, hioki_sample_count):
+                    hioki_samples[-1]["pass"] = False
+                    if not hioki_samples[-1].get("error"):
+                        hioki_samples[-1]["error"] = "PLC切位失败"
+                    result["is_pass"] = False
+                    break
+
+            hioki_pass = len(hioki_samples) == hioki_sample_count and all(sample.get("pass") for sample in hioki_samples)
+            hioki_raws = [sample.get("raw") for sample in hioki_samples]
+            first_hioki = next((value for value in hioki_raws if value is not None), 0.0)
+            result["Hioki"] = {
+                "val": self.format_hioki_samples(hioki_samples, hioki_sample_count),
+                "pass": hioki_pass,
+                "raw": float(first_hioki),
+                "samples": copy.deepcopy(hioki_samples)
+            }
+            result["Hioki_raws"] = hioki_raws
+            if not hioki_pass:
                 result["is_pass"] = False
-                self.hioki.is_connected = False
             self.task_finished_signal.emit('hioki')
 
         # 3. 动态反电势
@@ -299,7 +465,7 @@ class AutoTestThread(QThread):
     def clear_task_bits(self, task_name):
         task_cfg = self.get_task_config(task_name)
         bit_values = {}
-        for bit_key in ("start_bit", "done_bit"):
+        for bit_key in ("start_bit", "done_bit", "position_done_bit"):
             if bit_key in task_cfg:
                 bit_values[int(task_cfg[bit_key])] = False
         if bit_values:
@@ -390,9 +556,19 @@ class MotorTestApp(QObject):
             self.ui.table_data.horizontalHeader().setMinimumHeight(65)
             self.ui.table_data.setWordWrap(True)
             self.ui.table_data.setColumnCount(8)
+            self.ui.table_data.setHorizontalHeaderLabels([
+                "SN码",
+                "静态测试\n电阻电感(3组)",
+                "静态测试\n匝间(3组)",
+                "U相\nVp/THD/谐波",
+                "V相\nVp/THD/谐波",
+                "W相\nVp/THD/谐波",
+                "相位差",
+                "判断"
+            ])
             self.ui.table_data.setColumnWidth(0, 120)  # SN
-            self.ui.table_data.setColumnWidth(1, 120)  # 电阻电感
-            self.ui.table_data.setColumnWidth(2, 80)  # 匝间
+            self.ui.table_data.setColumnWidth(1, 180)  # 电阻电感
+            self.ui.table_data.setColumnWidth(2, 120)  # 匝间
             self.ui.table_data.setColumnWidth(3, 140)  # U相综合
             self.ui.table_data.setColumnWidth(4, 140)  # V相综合
             self.ui.table_data.setColumnWidth(5, 140)  # W相综合
@@ -510,8 +686,24 @@ class MotorTestApp(QObject):
                 "pc_to_plc_bit": 0
             },
             "signals": {
-                "lcr": {"name": "电阻电感", "ready_bit": 3, "start_bit": 1, "done_bit": 4},
-                "hioki": {"name": "匝间", "ready_bit": 8, "start_bit": 6, "done_bit": 9},
+                "lcr": {
+                    "name": "电阻电感",
+                    "ready_bit": 3,
+                    "start_bit": 1,
+                    "done_bit": 4,
+                    "position_done_bit": 8,
+                    "sample_count": 3,
+                    "position_switch_timeout_sec": 60.0
+                },
+                "hioki": {
+                    "name": "匝间",
+                    "ready_bit": 3,
+                    "start_bit": 6,
+                    "done_bit": 4,
+                    "position_done_bit": 8,
+                    "sample_count": 3,
+                    "position_switch_timeout_sec": 60.0
+                },
                 "labjack": {"name": "反电势", "ready_bit": 3, "start_bit": 5, "done_bit": 14}
             }
         }
@@ -539,8 +731,13 @@ class MotorTestApp(QObject):
         config["poll_interval_sec"] = float(config["poll_interval_sec"])
         config["sequence"] = [task for task in config["sequence"] if task in config["signals"]]
         for task_cfg in config["signals"].values():
-            for bit_key in ("ready_bit", "start_bit", "done_bit"):
-                task_cfg[bit_key] = int(task_cfg[bit_key])
+            for bit_key in ("ready_bit", "start_bit", "done_bit", "position_done_bit"):
+                if bit_key in task_cfg:
+                    task_cfg[bit_key] = int(task_cfg[bit_key])
+            if "sample_count" in task_cfg:
+                task_cfg["sample_count"] = max(1, int(task_cfg["sample_count"]))
+            if "position_switch_timeout_sec" in task_cfg:
+                task_cfg["position_switch_timeout_sec"] = float(task_cfg["position_switch_timeout_sec"])
         return config
 
     def load_settings(self):
@@ -721,7 +918,7 @@ class MotorTestApp(QObject):
         bit_values = {}
         for task_name in task_names:
             task_cfg = signals.get(task_name, {})
-            for bit_key in ("start_bit", "done_bit"):
+            for bit_key in ("start_bit", "done_bit", "position_done_bit"):
                 if bit_key in task_cfg:
                     bit_values[int(task_cfg[bit_key])] = False
         if bit_values:
@@ -748,6 +945,8 @@ class MotorTestApp(QObject):
             task_cfg = signals.get(task_name, {})
             if "done_bit" in task_cfg:
                 bit_values[int(task_cfg["done_bit"])] = False
+            if "position_done_bit" in task_cfg:
+                bit_values[int(task_cfg["position_done_bit"])] = False
             if "start_bit" in task_cfg:
                 bit_values[int(task_cfg["start_bit"])] = True
                 labels.append(self.get_plc_task_label(task_name))
@@ -949,8 +1148,19 @@ class MotorTestApp(QObject):
                 self.ui.lbl_status.setText("TESTING...")
             self.ui.lbl_status.setStyleSheet("background-color: yellow; color: black;")
 
-        self.worker = TestThread(self.lcr, self.hioki, self.labjack, sn, tasks, current_model, self.labjack_duration)
+        self.worker = TestThread(
+            self.lcr,
+            self.hioki,
+            self.labjack,
+            sn,
+            tasks,
+            current_model,
+            self.labjack_duration,
+            self.plc,
+            self.plc_dm_config
+        )
         self.worker.wave_render_signal.connect(self.render_captured_wave)
+        self.worker.log_signal.connect(self.log_message)
         if not self.is_auto_mode and forced_tasks is None and self.manual_plc_tasks:
             self.worker.task_finished_signal.connect(self.on_manual_task_finished)
         self.worker.finished_signal.connect(self.on_test_finished)
@@ -980,8 +1190,8 @@ class MotorTestApp(QObject):
 
     def create_empty_result(self):
         return {
-            "RL": {"val": "未测试", "pass": True},
-            "Hioki": {"val": "未测试", "pass": True, "raw": 0.0},
+            "RL": {"val": "未测试", "pass": True, "samples": []},
+            "Hioki": {"val": "未测试", "pass": True, "raw": 0.0, "samples": []},
             "U": {"val": "未测试", "pass": True},
             "V": {"val": "未测试", "pass": True},
             "W": {"val": "未测试", "pass": True},
@@ -989,6 +1199,9 @@ class MotorTestApp(QObject):
             "is_pass": True,
             "R_raw": 0.0,
             "L_raw": 0.0,
+            "R_raws": [],
+            "L_raws": [],
+            "Hioki_raws": [],
             "BEMF": {
                 "pass": True,
                 "raw_peaks": [0.0, 0.0, 0.0],
@@ -1004,9 +1217,12 @@ class MotorTestApp(QObject):
             merged["RL"] = copy.deepcopy(new_result["RL"])
             merged["R_raw"] = new_result["R_raw"]
             merged["L_raw"] = new_result["L_raw"]
+            merged["R_raws"] = copy.deepcopy(new_result.get("R_raws", [new_result["R_raw"]]))
+            merged["L_raws"] = copy.deepcopy(new_result.get("L_raws", [new_result["L_raw"]]))
 
         if new_result["Hioki"]["val"] != "未测试":
             merged["Hioki"] = copy.deepcopy(new_result["Hioki"])
+            merged["Hioki_raws"] = copy.deepcopy(new_result.get("Hioki_raws", [new_result["Hioki"].get("raw", 0.0)]))
 
         if new_result["U"]["val"] != "未测试":
             merged["U"] = copy.deepcopy(new_result["U"])
@@ -1079,6 +1295,17 @@ class MotorTestApp(QObject):
         chk_hioki_active = result_dict["Hioki"]["val"] != "未测试"
         chk_lj_active = result_dict["U"]["val"] != "未测试"
 
+        r_values = result_dict.get("R_raws") or [result_dict.get("R_raw", 0.0)]
+        l_values = result_dict.get("L_raws") or [result_dict.get("L_raw", 0.0)]
+        hioki_values = result_dict.get("Hioki_raws") or [result_dict.get("Hioki", {}).get("raw", 0.0)]
+
+        def sample_value(values, index, active):
+            if not active:
+                return "未测试"
+            if index < len(values) and values[index] is not None:
+                return values[index]
+            return "异常"
+
         u_h = result_dict["BEMF"].get("raw_harmonics", [[0, 0, 0, 0]])[0]
         v_h = result_dict["BEMF"].get("raw_harmonics", [[0, 0, 0, 0], [0, 0, 0, 0]])[1]
         w_h = result_dict["BEMF"].get("raw_harmonics", [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]])[2]
@@ -1086,9 +1313,15 @@ class MotorTestApp(QObject):
 
         return {
             "sn": sn_to_save,
-            "r_val": result_dict["R_raw"] if chk_lcr_active else "未测试",
-            "l_val": result_dict["L_raw"] if chk_lcr_active else "未测试",
-            "hioki_val": result_dict["Hioki"]["raw"] if chk_hioki_active else "未测试",
+            "r_val": sample_value(r_values, 0, chk_lcr_active),
+            "l_val": sample_value(l_values, 0, chk_lcr_active),
+            "r_val_2": sample_value(r_values, 1, chk_lcr_active),
+            "l_val_2": sample_value(l_values, 1, chk_lcr_active),
+            "r_val_3": sample_value(r_values, 2, chk_lcr_active),
+            "l_val_3": sample_value(l_values, 2, chk_lcr_active),
+            "hioki_val": sample_value(hioki_values, 0, chk_hioki_active),
+            "hioki_val_2": sample_value(hioki_values, 1, chk_hioki_active),
+            "hioki_val_3": sample_value(hioki_values, 2, chk_hioki_active),
             "u_vp": result_dict["BEMF"]["raw_peaks"][0] if chk_lj_active else "未测试",
             "v_vp": result_dict["BEMF"]["raw_peaks"][1] if chk_lj_active else "未测试",
             "w_vp": result_dict["BEMF"]["raw_peaks"][2] if chk_lj_active else "未测试",
