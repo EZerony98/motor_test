@@ -20,7 +20,8 @@
         "left_servo_speed_value": 2888.0,
         "pc_stop_addr": 4000,
         "pc_stop_value": 1,
-        "pc_stop_idle_value": 1
+        "pc_stop_idle_value": 0,
+        "pc_stop_reset_delay_sec": 0.5
     },
     "plc_dm_addresses": {
         "word_addr": 3500,

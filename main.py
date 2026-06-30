@@ -533,6 +533,7 @@ class MotorTestApp(QObject):
         self.plc_pc_stop_addr = 4000
         self.plc_pc_stop_value = 1
         self.plc_pc_stop_idle_value = 0
+        self.plc_pc_stop_reset_delay_sec = 0.5
         self._stdout_original = sys.stdout
         self._stderr_original = sys.stderr
         self._stdout_proxy = None
@@ -798,6 +799,9 @@ class MotorTestApp(QObject):
                     self.plc_pc_stop_idle_value = int(
                         plc_control.get("pc_stop_idle_value", self.plc_pc_stop_idle_value)
                     )
+                    self.plc_pc_stop_reset_delay_sec = float(
+                        plc_control.get("pc_stop_reset_delay_sec", self.plc_pc_stop_reset_delay_sec)
+                    )
 
                     compensation = data.get("compensation", {})
                     self.lcr.set_compensation(
@@ -907,6 +911,21 @@ class MotorTestApp(QObject):
             self.plc_pc_stop_value,
             "停止/复位信号"
         )
+
+    def pulse_plc_stop_signal(self):
+        if not self.write_plc_stop_signal():
+            return False
+
+        delay_ms = max(0, int(self.plc_pc_stop_reset_delay_sec * 1000))
+        if delay_ms == 0:
+            self.clear_plc_stop_signal()
+        else:
+            self.log_message(
+                f"停止/复位信号将在 {self.plc_pc_stop_reset_delay_sec:.1f} 秒后复位为 "
+                f"{self.plc_pc_stop_idle_value}"
+            )
+            QTimer.singleShot(delay_ms, self.clear_plc_stop_signal)
+        return True
 
     def clear_plc_task_bits(self, task_names=None):
         if not self.plc.is_connected:
@@ -1094,9 +1113,6 @@ class MotorTestApp(QObject):
             QMessageBox.warning(self.ui, "提示", "请至少勾选一个测试项目！")
             return
 
-        if not self.clear_plc_stop_signal():
-            QMessageBox.warning(self.ui, "提示", "PLC 停止/复位信号复位失败，请检查 PLC 通讯。")
-            return
         if not self.write_plc_left_servo_speed():
             QMessageBox.warning(self.ui, "提示", "左伺服电机转速写入失败，请检查 PLC 通讯。")
             return
@@ -1478,7 +1494,7 @@ class MotorTestApp(QObject):
         self.is_auto_mode = False
         if self.auto_thread: self.auto_thread.stop()
         self.clear_plc_task_bits(self.auto_task_order or None)
-        self.write_plc_stop_signal()
+        self.pulse_plc_stop_signal()
         self.plc_sequence_mode = None
         self.manual_plc_tasks = []
         self.manual_plc_done_pending_count = 0
