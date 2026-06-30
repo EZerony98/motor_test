@@ -40,6 +40,11 @@
                 "done_bit": 4,
                 "position_done_bit": 8,
                 "sample_count": 3,
+                "stabilize_read_sec": 2.0,
+                "stabilize_read_interval_sec": 0.2,
+                "stabilize_required_count": 3,
+                "stabilize_r_tolerance_mohm": 2.0,
+                "stabilize_l_tolerance_uh": 2.0,
                 "position_switch_timeout_sec": 60.0
             },
             "hioki": {
@@ -61,7 +66,12 @@
     },
     "compensation": {
         "lcr_comp_r": 0.0,
-        "lcr_comp_l": 0.0
+        "lcr_comp_l": 0.0,
+        "resistance_compensation_mohm": {
+            "u": 0.0,
+            "v": -40.0,
+            "w": -41.0
+        }
     },
     "product_models": {
         "22MP224": {

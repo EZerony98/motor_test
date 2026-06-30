@@ -84,13 +84,26 @@ class TestThread(QThread):
     task_finished_signal = Signal(str)
     log_signal = Signal(str)
 
-    def __init__(self, lcr, hioki, labjack, sn, tasks, model_name, labjack_duration=1.0, plc=None, plc_dm_config=None):
+    def __init__(
+        self,
+        lcr,
+        hioki,
+        labjack,
+        sn,
+        tasks,
+        model_name,
+        labjack_duration=1.0,
+        plc=None,
+        plc_dm_config=None,
+        resistance_compensations=None
+    ):
         super().__init__()
         self.lcr, self.hioki, self.labjack = lcr, hioki, labjack
         self.sn, self.tasks, self.model_name = sn, tasks, model_name
         self.labjack_duration = labjack_duration
         self.plc = plc
         self.plc_dm_config = plc_dm_config or {}
+        self.resistance_compensations = resistance_compensations or [0.0, -40.0, -41.0]
 
     @staticmethod
     def _range_from_specs(specs, range_key, min_key, max_key, default_min, default_max):
@@ -110,6 +123,74 @@ class TestThread(QThread):
             return max(1, int(task_cfg.get("sample_count", 1)))
         except (TypeError, ValueError):
             return 1
+
+    def get_resistance_compensation(self, sample_index):
+        compensation_index = sample_index - 1
+        if compensation_index < len(self.resistance_compensations):
+            return float(self.resistance_compensations[compensation_index])
+        return 0.0
+
+    def fetch_stable_lcr_data(self, sample_index):
+        task_cfg = self.get_task_config("lcr")
+        stabilize_sec = float(task_cfg.get("stabilize_read_sec", 0.0))
+        poll_interval = float(task_cfg.get("stabilize_read_interval_sec", 0.2))
+        required_count = max(1, int(task_cfg.get("stabilize_required_count", 3)))
+        r_tolerance = float(task_cfg.get("stabilize_r_tolerance_mohm", 2.0))
+        l_tolerance = float(task_cfg.get("stabilize_l_tolerance_uh", 2.0))
+
+        if stabilize_sec <= 0:
+            return self.lcr.fetch_data()
+
+        self.log(f"LCR 第 {sample_index} 组到位后稳定读取 {stabilize_sec:.1f}s")
+        deadline = time.time() + stabilize_sec
+        valid_reads = []
+        last_raw = None
+        latest_stable = None
+
+        while True:
+            raw = self.lcr.fetch_data()
+            if raw and raw.get("R") is not None and raw.get("L") is not None:
+                raw = dict(raw)
+                raw["R"] = float(raw["R"])
+                raw["L"] = float(raw["L"])
+                last_raw = raw
+                valid_reads.append(raw)
+
+                window = valid_reads[-required_count:]
+                if len(window) == required_count:
+                    r_values = [item["R"] for item in window]
+                    l_values = [item["L"] for item in window]
+                    r_span = max(r_values) - min(r_values)
+                    l_span = max(l_values) - min(l_values)
+                    if r_span <= r_tolerance and l_span <= l_tolerance:
+                        latest_stable = dict(window[-1])
+                        latest_stable["R"] = sum(r_values) / len(r_values)
+                        latest_stable["L"] = sum(l_values) / len(l_values)
+                        latest_stable["stable"] = True
+                        latest_stable["r_span"] = r_span
+                        latest_stable["l_span"] = l_span
+
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            time.sleep(min(max(poll_interval, 0.05), remaining))
+
+        if latest_stable:
+            self.log(
+                f"LCR 第 {sample_index} 组读数稳定: "
+                f"R波动 {latest_stable['r_span']:.4f} mΩ, L波动 {latest_stable['l_span']:.4f} µH"
+            )
+            return latest_stable
+        if last_raw:
+            last_raw = dict(last_raw)
+            last_raw["stable"] = False
+            last_raw["error"] = "读数未稳定"
+            self.log(
+                f"LCR 第 {sample_index} 组读数未稳定，使用最后一次有效值: "
+                f"R {last_raw['R']:.4f} mΩ / L {last_raw['L']:.4f} µH"
+            )
+            return last_raw
+        return None
 
     def log(self, message):
         self.log_signal.emit(message)
@@ -140,6 +221,22 @@ class TestThread(QThread):
                 self.log(f"等待 PLC {label}: DM{word_addr}.{int(bit_index):02d}={value_text}")
                 last_log_at = now
             time.sleep(poll_interval)
+
+    def wait_initial_task_ready(self, task_name):
+        task_cfg = self.get_task_config(task_name)
+        if "ready_bit" not in task_cfg:
+            return True
+        if not self.plc or not self.plc.is_connected:
+            return True
+
+        ready_bit = int(task_cfg["ready_bit"])
+        timeout_sec = float(task_cfg.get("position_switch_timeout_sec", 60.0))
+        return self.wait_plc_bit(
+            ready_bit,
+            True,
+            f"{self.get_task_label(task_name)} 当前工位就绪",
+            timeout_sec
+        )
 
     def complete_position_sample(self, task_name, position_index, total_positions):
         task_cfg = self.get_task_config(task_name)
@@ -181,8 +278,9 @@ class TestThread(QThread):
     @staticmethod
     def format_lcr_samples(samples, sample_count, r_min, r_max, l_min, l_max):
         lines = []
+        phase_labels = ["U", "V", "W"]
         for index in range(sample_count):
-            sample_no = index + 1
+            sample_no = phase_labels[index] if index < len(phase_labels) else str(index + 1)
             if index >= len(samples):
                 lines.append(f"{sample_no}: 未完成")
                 continue
@@ -190,7 +288,8 @@ class TestThread(QThread):
             if sample.get("R") is None or sample.get("L") is None:
                 lines.append(f"{sample_no}: {sample.get('error', '通讯异常')}")
             else:
-                lines.append(f"{sample_no}: R {sample['R']:.4f} mΩ / L {sample['L']:.4f} µH")
+                stability_text = "" if sample.get("stable", True) else " / 读数未稳定"
+                lines.append(f"{sample_no}: R {sample['R']:.4f} mΩ / L {sample['L']:.4f} µH{stability_text}")
         lines.append(f"R[{r_min}~{r_max}] L[{l_min}~{l_max}]")
         return "\n".join(lines)
 
@@ -239,27 +338,42 @@ class TestThread(QThread):
         if self.tasks.get('lcr'):
             lcr_sample_count = self.get_task_sample_count('lcr')
             lcr_samples = []
-            for sample_index in range(1, lcr_sample_count + 1):
-                raw = self.lcr.fetch_data()
-                if raw:
-                    r_raw = float(raw['R'])
-                    l_raw = float(raw['L'])
-                    r_ok = r_min <= r_raw <= r_max
-                    l_ok = l_min <= l_raw <= l_max
-                    lcr_samples.append({"R": r_raw, "L": l_raw, "pass": r_ok and l_ok})
-                    if not (r_ok and l_ok):
+            if not self.wait_initial_task_ready('lcr'):
+                lcr_samples.append({"R": None, "L": None, "pass": False, "error": "PLC未就绪"})
+                result["is_pass"] = False
+            else:
+                for sample_index in range(1, lcr_sample_count + 1):
+                    raw = self.fetch_stable_lcr_data(sample_index)
+                    if raw:
+                        r_measured = float(raw['R'])
+                        r_compensation = self.get_resistance_compensation(sample_index)
+                        r_raw = r_measured + r_compensation
+                        l_raw = float(raw['L'])
+                        stable_ok = bool(raw.get("stable", True))
+                        r_ok = r_min <= r_raw <= r_max
+                        l_ok = l_min <= l_raw <= l_max
+                        lcr_samples.append({
+                            "R": r_raw,
+                            "R_measured": r_measured,
+                            "R_compensation": r_compensation,
+                            "L": l_raw,
+                            "stable": stable_ok,
+                            "error": raw.get("error", ""),
+                            "pass": stable_ok and r_ok and l_ok
+                        })
+                        if not (stable_ok and r_ok and l_ok):
+                            result["is_pass"] = False
+                    else:
+                        lcr_samples.append({"R": None, "L": None, "pass": False, "error": "通讯异常"})
                         result["is_pass"] = False
-                else:
-                    lcr_samples.append({"R": None, "L": None, "pass": False, "error": "通讯异常"})
-                    result["is_pass"] = False
-                    self.lcr.is_connected = False
+                        self.lcr.is_connected = False
 
-                if not self.complete_position_sample('lcr', sample_index, lcr_sample_count):
-                    lcr_samples[-1]["pass"] = False
-                    if not lcr_samples[-1].get("error"):
-                        lcr_samples[-1]["error"] = "PLC切位失败"
-                    result["is_pass"] = False
-                    break
+                    if not self.complete_position_sample('lcr', sample_index, lcr_sample_count):
+                        lcr_samples[-1]["pass"] = False
+                        if not lcr_samples[-1].get("error"):
+                            lcr_samples[-1]["error"] = "PLC切位失败"
+                        result["is_pass"] = False
+                        break
 
             lcr_pass = len(lcr_samples) == lcr_sample_count and all(sample.get("pass") for sample in lcr_samples)
             r_values = [sample.get("R") for sample in lcr_samples]
@@ -534,6 +648,7 @@ class MotorTestApp(QObject):
         self.plc_pc_stop_value = 1
         self.plc_pc_stop_idle_value = 0
         self.plc_pc_stop_reset_delay_sec = 0.5
+        self.resistance_compensations = [0.0, -40.0, -41.0]
         self._stdout_original = sys.stdout
         self._stderr_original = sys.stderr
         self._stdout_proxy = None
@@ -631,6 +746,39 @@ class MotorTestApp(QObject):
             except Exception as e:
                 print(f"⚠️ 解析 data_schema.json 失败: {e}")
 
+    @staticmethod
+    def normalize_resistance_compensations(compensation):
+        defaults = [0.0, -40.0, -41.0]
+        if not isinstance(compensation, dict):
+            return defaults
+
+        def to_float(value, default):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        phase_config = compensation.get("resistance_compensation_mohm")
+        if isinstance(phase_config, dict):
+            return [
+                to_float(phase_config.get("u"), defaults[0]),
+                to_float(phase_config.get("v"), defaults[1]),
+                to_float(phase_config.get("w"), defaults[2])
+            ]
+
+        list_config = compensation.get("resistance_comp_uvw")
+        if isinstance(list_config, (list, tuple)):
+            values = defaults[:]
+            for index, value in enumerate(list_config[:3]):
+                values[index] = to_float(value, defaults[index])
+            return values
+
+        return [
+            to_float(compensation.get("resistance_comp_u"), defaults[0]),
+            to_float(compensation.get("resistance_comp_v"), defaults[1]),
+            to_float(compensation.get("resistance_comp_w"), defaults[2])
+        ]
+
     def setup_graph(self):
         if not hasattr(self.ui, 'graph_widget'): return
         self.plot_item = self.ui.graph_widget.getPlotItem()
@@ -694,6 +842,11 @@ class MotorTestApp(QObject):
                     "done_bit": 4,
                     "position_done_bit": 8,
                     "sample_count": 3,
+                    "stabilize_read_sec": 2.0,
+                    "stabilize_read_interval_sec": 0.2,
+                    "stabilize_required_count": 3,
+                    "stabilize_r_tolerance_mohm": 2.0,
+                    "stabilize_l_tolerance_uh": 2.0,
                     "position_switch_timeout_sec": 60.0
                 },
                 "hioki": {
@@ -739,6 +892,16 @@ class MotorTestApp(QObject):
                 task_cfg["sample_count"] = max(1, int(task_cfg["sample_count"]))
             if "position_switch_timeout_sec" in task_cfg:
                 task_cfg["position_switch_timeout_sec"] = float(task_cfg["position_switch_timeout_sec"])
+            if "stabilize_read_sec" in task_cfg:
+                task_cfg["stabilize_read_sec"] = float(task_cfg["stabilize_read_sec"])
+            if "stabilize_read_interval_sec" in task_cfg:
+                task_cfg["stabilize_read_interval_sec"] = float(task_cfg["stabilize_read_interval_sec"])
+            if "stabilize_required_count" in task_cfg:
+                task_cfg["stabilize_required_count"] = max(1, int(task_cfg["stabilize_required_count"]))
+            if "stabilize_r_tolerance_mohm" in task_cfg:
+                task_cfg["stabilize_r_tolerance_mohm"] = float(task_cfg["stabilize_r_tolerance_mohm"])
+            if "stabilize_l_tolerance_uh" in task_cfg:
+                task_cfg["stabilize_l_tolerance_uh"] = float(task_cfg["stabilize_l_tolerance_uh"])
         return config
 
     def load_settings(self):
@@ -808,6 +971,7 @@ class MotorTestApp(QObject):
                         compensation.get("lcr_comp_r", 0.0),
                         compensation.get("lcr_comp_l", 0.0)
                     )
+                    self.resistance_compensations = self.normalize_resistance_compensations(compensation)
             except Exception as e:
                 print(f"⚠️ 加载 config/config.json 失败: {e}")
 
@@ -1173,7 +1337,8 @@ class MotorTestApp(QObject):
             current_model,
             self.labjack_duration,
             self.plc,
-            self.plc_dm_config
+            self.plc_dm_config,
+            self.resistance_compensations
         )
         self.worker.wave_render_signal.connect(self.render_captured_wave)
         self.worker.log_signal.connect(self.log_message)
