@@ -14,7 +14,7 @@
         "labjack_duration": 1.0
     },
     "plc_control": {
-        "done_delay_sec": 2.0,
+        "done_delay_sec": 1.0,
         "left_servo_speed_addrs": [3800],
         "left_servo_speed_type": "float32",
         "left_servo_speed_value": 2888.0,
@@ -40,11 +40,13 @@
                 "done_bit": 4,
                 "position_done_bit": 8,
                 "sample_count": 3,
+                "ready_delay_sec": 1.0,
                 "stabilize_read_sec": 2.0,
                 "stabilize_read_interval_sec": 0.2,
                 "stabilize_required_count": 3,
                 "stabilize_r_tolerance_mohm": 2.0,
                 "stabilize_l_tolerance_uh": 2.0,
+                "position_done_delay_sec": 1.0,
                 "position_switch_timeout_sec": 60.0
             },
             "hioki": {
@@ -71,6 +73,11 @@
             "u": 0.0,
             "v": -40.0,
             "w": -41.0
+        },
+        "inductance_compensation_uh": {
+            "u": 0.0,
+            "v": 0.0,
+            "w": 0.0
         }
     },
     "product_models": {

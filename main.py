@@ -95,7 +95,8 @@ class TestThread(QThread):
         labjack_duration=1.0,
         plc=None,
         plc_dm_config=None,
-        resistance_compensations=None
+        resistance_compensations=None,
+        inductance_compensations=None
     ):
         super().__init__()
         self.lcr, self.hioki, self.labjack = lcr, hioki, labjack
@@ -104,6 +105,7 @@ class TestThread(QThread):
         self.plc = plc
         self.plc_dm_config = plc_dm_config or {}
         self.resistance_compensations = resistance_compensations or [0.0, -40.0, -41.0]
+        self.inductance_compensations = inductance_compensations or [0.0, 0.0, 0.0]
 
     @staticmethod
     def _range_from_specs(specs, range_key, min_key, max_key, default_min, default_max):
@@ -128,6 +130,12 @@ class TestThread(QThread):
         compensation_index = sample_index - 1
         if compensation_index < len(self.resistance_compensations):
             return float(self.resistance_compensations[compensation_index])
+        return 0.0
+
+    def get_inductance_compensation(self, sample_index):
+        compensation_index = sample_index - 1
+        if compensation_index < len(self.inductance_compensations):
+            return float(self.inductance_compensations[compensation_index])
         return 0.0
 
     def fetch_stable_lcr_data(self, sample_index):
@@ -238,6 +246,24 @@ class TestThread(QThread):
             timeout_sec
         )
 
+    def delay_after_task_ready(self, task_name, position_index):
+        task_cfg = self.get_task_config(task_name)
+        delay_sec = float(task_cfg.get("ready_delay_sec", 0.0))
+        if delay_sec <= 0:
+            return
+
+        self.log(f"{self.get_task_label(task_name)} 第 {position_index} 组就绪后延迟 {delay_sec:.1f}s")
+        time.sleep(delay_sec)
+
+    def delay_before_position_done(self, task_name, position_index):
+        task_cfg = self.get_task_config(task_name)
+        delay_sec = float(task_cfg.get("position_done_delay_sec", 0.0))
+        if delay_sec <= 0:
+            return
+
+        self.log(f"{self.get_task_label(task_name)} 第 {position_index} 组完成后延迟 {delay_sec:.1f}s 再通知 PLC")
+        time.sleep(delay_sec)
+
     def complete_position_sample(self, task_name, position_index, total_positions):
         task_cfg = self.get_task_config(task_name)
         if "position_done_bit" not in task_cfg:
@@ -245,6 +271,8 @@ class TestThread(QThread):
         if not self.plc or not self.plc.is_connected:
             self.log(f"PLC 未连接，未写入 {self.get_task_label(task_name)} 第 {position_index} 组位置完成位")
             return False
+
+        self.delay_before_position_done(task_name, position_index)
 
         word_addr = int(self.plc_dm_config.get("word_addr", 3500))
         position_done_bit = int(task_cfg["position_done_bit"])
@@ -343,12 +371,15 @@ class TestThread(QThread):
                 result["is_pass"] = False
             else:
                 for sample_index in range(1, lcr_sample_count + 1):
+                    self.delay_after_task_ready('lcr', sample_index)
                     raw = self.fetch_stable_lcr_data(sample_index)
                     if raw:
                         r_measured = float(raw['R'])
                         r_compensation = self.get_resistance_compensation(sample_index)
                         r_raw = r_measured + r_compensation
-                        l_raw = float(raw['L'])
+                        l_measured = float(raw['L'])
+                        l_compensation = self.get_inductance_compensation(sample_index)
+                        l_raw = l_measured + l_compensation
                         stable_ok = bool(raw.get("stable", True))
                         r_ok = r_min <= r_raw <= r_max
                         l_ok = l_min <= l_raw <= l_max
@@ -357,6 +388,8 @@ class TestThread(QThread):
                             "R_measured": r_measured,
                             "R_compensation": r_compensation,
                             "L": l_raw,
+                            "L_measured": l_measured,
+                            "L_compensation": l_compensation,
                             "stable": stable_ok,
                             "error": raw.get("error", ""),
                             "pass": stable_ok and r_ok and l_ok
@@ -640,7 +673,7 @@ class MotorTestApp(QObject):
         self.plc_sequence_mode = None
         self.manual_plc_tasks = []
         self.manual_plc_done_pending_count = 0
-        self.plc_done_delay_sec = 2.0
+        self.plc_done_delay_sec = 1.0
         self.plc_left_servo_speed_addrs = [3800, 3802, 3804]
         self.plc_left_servo_speed_value = 3000.0
         self.plc_left_servo_speed_type = "float32"
@@ -649,6 +682,7 @@ class MotorTestApp(QObject):
         self.plc_pc_stop_idle_value = 0
         self.plc_pc_stop_reset_delay_sec = 0.5
         self.resistance_compensations = [0.0, -40.0, -41.0]
+        self.inductance_compensations = [0.0, 0.0, 0.0]
         self._stdout_original = sys.stdout
         self._stderr_original = sys.stderr
         self._stdout_proxy = None
@@ -779,6 +813,39 @@ class MotorTestApp(QObject):
             to_float(compensation.get("resistance_comp_w"), defaults[2])
         ]
 
+    @staticmethod
+    def normalize_inductance_compensations(compensation):
+        defaults = [0.0, 0.0, 0.0]
+        if not isinstance(compensation, dict):
+            return defaults
+
+        def to_float(value, default):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        phase_config = compensation.get("inductance_compensation_uh")
+        if isinstance(phase_config, dict):
+            return [
+                to_float(phase_config.get("u"), defaults[0]),
+                to_float(phase_config.get("v"), defaults[1]),
+                to_float(phase_config.get("w"), defaults[2])
+            ]
+
+        list_config = compensation.get("inductance_comp_uvw")
+        if isinstance(list_config, (list, tuple)):
+            values = defaults[:]
+            for index, value in enumerate(list_config[:3]):
+                values[index] = to_float(value, defaults[index])
+            return values
+
+        return [
+            to_float(compensation.get("inductance_comp_u"), defaults[0]),
+            to_float(compensation.get("inductance_comp_v"), defaults[1]),
+            to_float(compensation.get("inductance_comp_w"), defaults[2])
+        ]
+
     def setup_graph(self):
         if not hasattr(self.ui, 'graph_widget'): return
         self.plot_item = self.ui.graph_widget.getPlotItem()
@@ -842,11 +909,13 @@ class MotorTestApp(QObject):
                     "done_bit": 4,
                     "position_done_bit": 8,
                     "sample_count": 3,
+                    "ready_delay_sec": 1.0,
                     "stabilize_read_sec": 2.0,
                     "stabilize_read_interval_sec": 0.2,
                     "stabilize_required_count": 3,
                     "stabilize_r_tolerance_mohm": 2.0,
                     "stabilize_l_tolerance_uh": 2.0,
+                    "position_done_delay_sec": 1.0,
                     "position_switch_timeout_sec": 60.0
                 },
                 "hioki": {
@@ -892,6 +961,8 @@ class MotorTestApp(QObject):
                 task_cfg["sample_count"] = max(1, int(task_cfg["sample_count"]))
             if "position_switch_timeout_sec" in task_cfg:
                 task_cfg["position_switch_timeout_sec"] = float(task_cfg["position_switch_timeout_sec"])
+            if "ready_delay_sec" in task_cfg:
+                task_cfg["ready_delay_sec"] = float(task_cfg["ready_delay_sec"])
             if "stabilize_read_sec" in task_cfg:
                 task_cfg["stabilize_read_sec"] = float(task_cfg["stabilize_read_sec"])
             if "stabilize_read_interval_sec" in task_cfg:
@@ -902,6 +973,8 @@ class MotorTestApp(QObject):
                 task_cfg["stabilize_r_tolerance_mohm"] = float(task_cfg["stabilize_r_tolerance_mohm"])
             if "stabilize_l_tolerance_uh" in task_cfg:
                 task_cfg["stabilize_l_tolerance_uh"] = float(task_cfg["stabilize_l_tolerance_uh"])
+            if "position_done_delay_sec" in task_cfg:
+                task_cfg["position_done_delay_sec"] = float(task_cfg["position_done_delay_sec"])
         return config
 
     def load_settings(self):
@@ -972,6 +1045,7 @@ class MotorTestApp(QObject):
                         compensation.get("lcr_comp_l", 0.0)
                     )
                     self.resistance_compensations = self.normalize_resistance_compensations(compensation)
+                    self.inductance_compensations = self.normalize_inductance_compensations(compensation)
             except Exception as e:
                 print(f"⚠️ 加载 config/config.json 失败: {e}")
 
@@ -1338,7 +1412,8 @@ class MotorTestApp(QObject):
             self.labjack_duration,
             self.plc,
             self.plc_dm_config,
-            self.resistance_compensations
+            self.resistance_compensations,
+            self.inductance_compensations
         )
         self.worker.wave_render_signal.connect(self.render_captured_wave)
         self.worker.log_signal.connect(self.log_message)
@@ -1471,6 +1546,15 @@ class MotorTestApp(QObject):
         self.ui.table_data.resizeRowToContents(row_idx)
         self.ui.table_data.scrollToItem(self.ui.table_data.item(row_idx, 0))
 
+    @staticmethod
+    def format_csv_number(value, decimals):
+        if value in ("未测试", "异常", None, ""):
+            return value
+        try:
+            return f"{float(value):.{decimals}f}"
+        except (TypeError, ValueError):
+            return value
+
     def build_csv_row_map(self, result_dict, sn_to_save):
         chk_lcr_active = result_dict["RL"]["val"] != "未测试"
         chk_hioki_active = result_dict["Hioki"]["val"] != "未测试"
@@ -1480,11 +1564,11 @@ class MotorTestApp(QObject):
         l_values = result_dict.get("L_raws") or [result_dict.get("L_raw", 0.0)]
         hioki_values = result_dict.get("Hioki_raws") or [result_dict.get("Hioki", {}).get("raw", 0.0)]
 
-        def sample_value(values, index, active):
+        def sample_value(values, index, active, decimals):
             if not active:
                 return "未测试"
             if index < len(values) and values[index] is not None:
-                return values[index]
+                return self.format_csv_number(values[index], decimals)
             return "异常"
 
         u_h = result_dict["BEMF"].get("raw_harmonics", [[0, 0, 0, 0]])[0]
@@ -1494,27 +1578,27 @@ class MotorTestApp(QObject):
 
         return {
             "sn": sn_to_save,
-            "r_val": sample_value(r_values, 0, chk_lcr_active),
-            "l_val": sample_value(l_values, 0, chk_lcr_active),
-            "r_val_2": sample_value(r_values, 1, chk_lcr_active),
-            "l_val_2": sample_value(l_values, 1, chk_lcr_active),
-            "r_val_3": sample_value(r_values, 2, chk_lcr_active),
-            "l_val_3": sample_value(l_values, 2, chk_lcr_active),
-            "hioki_val": sample_value(hioki_values, 0, chk_hioki_active),
-            "hioki_val_2": sample_value(hioki_values, 1, chk_hioki_active),
-            "hioki_val_3": sample_value(hioki_values, 2, chk_hioki_active),
-            "u_vp": result_dict["BEMF"]["raw_peaks"][0] if chk_lj_active else "未测试",
-            "v_vp": result_dict["BEMF"]["raw_peaks"][1] if chk_lj_active else "未测试",
-            "w_vp": result_dict["BEMF"]["raw_peaks"][2] if chk_lj_active else "未测试",
-            "u_thd": result_dict["BEMF"]["raw_thds"][0] if chk_lj_active else "未测试",
-            "v_thd": result_dict["BEMF"]["raw_thds"][1] if chk_lj_active else "未测试",
-            "w_thd": result_dict["BEMF"]["raw_thds"][2] if chk_lj_active else "未测试",
+            "r_val": sample_value(r_values, 0, chk_lcr_active, 4),
+            "l_val": sample_value(l_values, 0, chk_lcr_active, 4),
+            "r_val_2": sample_value(r_values, 1, chk_lcr_active, 4),
+            "l_val_2": sample_value(l_values, 1, chk_lcr_active, 4),
+            "r_val_3": sample_value(r_values, 2, chk_lcr_active, 4),
+            "l_val_3": sample_value(l_values, 2, chk_lcr_active, 4),
+            "hioki_val": sample_value(hioki_values, 0, chk_hioki_active, 2),
+            "hioki_val_2": sample_value(hioki_values, 1, chk_hioki_active, 2),
+            "hioki_val_3": sample_value(hioki_values, 2, chk_hioki_active, 2),
+            "u_vp": self.format_csv_number(result_dict["BEMF"]["raw_peaks"][0], 2) if chk_lj_active else "未测试",
+            "v_vp": self.format_csv_number(result_dict["BEMF"]["raw_peaks"][1], 2) if chk_lj_active else "未测试",
+            "w_vp": self.format_csv_number(result_dict["BEMF"]["raw_peaks"][2], 2) if chk_lj_active else "未测试",
+            "u_thd": self.format_csv_number(result_dict["BEMF"]["raw_thds"][0], 2) if chk_lj_active else "未测试",
+            "v_thd": self.format_csv_number(result_dict["BEMF"]["raw_thds"][1], 2) if chk_lj_active else "未测试",
+            "w_thd": self.format_csv_number(result_dict["BEMF"]["raw_thds"][2], 2) if chk_lj_active else "未测试",
             "u_harmonics": format_h(u_h),
             "v_harmonics": format_h(v_h),
             "w_harmonics": format_h(w_h),
-            "uv_phase": result_dict["Phase"]["raw_diffs"][0] if chk_lj_active else "未测试",
-            "vw_phase": result_dict["Phase"]["raw_diffs"][1] if chk_lj_active else "未测试",
-            "wu_phase": result_dict["Phase"]["raw_diffs"][2] if chk_lj_active else "未测试",
+            "uv_phase": self.format_csv_number(result_dict["Phase"]["raw_diffs"][0], 2) if chk_lj_active else "未测试",
+            "vw_phase": self.format_csv_number(result_dict["Phase"]["raw_diffs"][1], 2) if chk_lj_active else "未测试",
+            "wu_phase": self.format_csv_number(result_dict["Phase"]["raw_diffs"][2], 2) if chk_lj_active else "未测试",
             "judgment": "PASS" if result_dict["is_pass"] else "FAIL",
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
         }
