@@ -143,17 +143,21 @@ class TestThread(QThread):
         stabilize_sec = float(task_cfg.get("stabilize_read_sec", 0.0))
         poll_interval = float(task_cfg.get("stabilize_read_interval_sec", 0.2))
         required_count = max(1, int(task_cfg.get("stabilize_required_count", 3)))
+        discard_count = max(0, int(task_cfg.get("stabilize_discard_count", 3)))
         r_tolerance = float(task_cfg.get("stabilize_r_tolerance_mohm", 2.0))
         l_tolerance = float(task_cfg.get("stabilize_l_tolerance_uh", 2.0))
+        max_drop_mohm = float(task_cfg.get("stabilize_max_drop_mohm", 1.0))
 
         if stabilize_sec <= 0:
             return self.lcr.fetch_data()
 
-        self.log(f"LCR 第 {sample_index} 组到位后稳定读取 {stabilize_sec:.1f}s")
+        self.log(
+            f"LCR 第 {sample_index} 组稳定读取最多 {stabilize_sec:.1f}s: "
+            f"丢弃前 {discard_count} 次, 连续 {required_count} 次稳定后取平均"
+        )
         deadline = time.time() + stabilize_sec
         valid_reads = []
         last_raw = None
-        latest_stable = None
 
         while True:
             raw = self.lcr.fetch_data()
@@ -164,38 +168,42 @@ class TestThread(QThread):
                 last_raw = raw
                 valid_reads.append(raw)
 
-                window = valid_reads[-required_count:]
+                usable_reads = valid_reads[discard_count:]
+                window = usable_reads[-required_count:]
                 if len(window) == required_count:
                     r_values = [item["R"] for item in window]
                     l_values = [item["L"] for item in window]
                     r_span = max(r_values) - min(r_values)
                     l_span = max(l_values) - min(l_values)
-                    if r_span <= r_tolerance and l_span <= l_tolerance:
-                        latest_stable = dict(window[-1])
-                        latest_stable["R"] = sum(r_values) / len(r_values)
-                        latest_stable["L"] = sum(l_values) / len(l_values)
-                        latest_stable["stable"] = True
-                        latest_stable["r_span"] = r_span
-                        latest_stable["l_span"] = l_span
+                    r_drop = r_values[0] - r_values[-1]
+                    drop_ok = max_drop_mohm < 0 or r_drop <= max_drop_mohm
+                    if r_span <= r_tolerance and l_span <= l_tolerance and drop_ok:
+                        stable_read = dict(window[-1])
+                        stable_read["R"] = sum(r_values) / len(r_values)
+                        stable_read["L"] = sum(l_values) / len(l_values)
+                        stable_read["stable"] = True
+                        stable_read["r_span"] = r_span
+                        stable_read["l_span"] = l_span
+                        stable_read["r_drop"] = r_drop
+                        self.log(
+                            f"LCR 第 {sample_index} 组读数稳定: "
+                            f"R波动 {r_span:.4f} mΩ, L波动 {l_span:.4f} µH, R下降 {r_drop:.4f} mΩ"
+                        )
+                        return stable_read
 
             remaining = deadline - time.time()
             if remaining <= 0:
                 break
             time.sleep(min(max(poll_interval, 0.05), remaining))
 
-        if latest_stable:
-            self.log(
-                f"LCR 第 {sample_index} 组读数稳定: "
-                f"R波动 {latest_stable['r_span']:.4f} mΩ, L波动 {latest_stable['l_span']:.4f} µH"
-            )
-            return latest_stable
         if last_raw:
             last_raw = dict(last_raw)
             last_raw["stable"] = False
             last_raw["error"] = "读数未稳定"
             self.log(
                 f"LCR 第 {sample_index} 组读数未稳定，使用最后一次有效值: "
-                f"R {last_raw['R']:.4f} mΩ / L {last_raw['L']:.4f} µH"
+                f"R {last_raw['R']:.4f} mΩ / L {last_raw['L']:.4f} µH, "
+                f"有效读数 {len(valid_reads)} 次"
             )
             return last_raw
         return None
@@ -913,8 +921,10 @@ class MotorTestApp(QObject):
                     "stabilize_read_sec": 2.0,
                     "stabilize_read_interval_sec": 0.2,
                     "stabilize_required_count": 3,
+                    "stabilize_discard_count": 3,
                     "stabilize_r_tolerance_mohm": 2.0,
                     "stabilize_l_tolerance_uh": 2.0,
+                    "stabilize_max_drop_mohm": 1.0,
                     "position_done_delay_sec": 1.0,
                     "position_switch_timeout_sec": 60.0
                 },
@@ -969,10 +979,14 @@ class MotorTestApp(QObject):
                 task_cfg["stabilize_read_interval_sec"] = float(task_cfg["stabilize_read_interval_sec"])
             if "stabilize_required_count" in task_cfg:
                 task_cfg["stabilize_required_count"] = max(1, int(task_cfg["stabilize_required_count"]))
+            if "stabilize_discard_count" in task_cfg:
+                task_cfg["stabilize_discard_count"] = max(0, int(task_cfg["stabilize_discard_count"]))
             if "stabilize_r_tolerance_mohm" in task_cfg:
                 task_cfg["stabilize_r_tolerance_mohm"] = float(task_cfg["stabilize_r_tolerance_mohm"])
             if "stabilize_l_tolerance_uh" in task_cfg:
                 task_cfg["stabilize_l_tolerance_uh"] = float(task_cfg["stabilize_l_tolerance_uh"])
+            if "stabilize_max_drop_mohm" in task_cfg:
+                task_cfg["stabilize_max_drop_mohm"] = float(task_cfg["stabilize_max_drop_mohm"])
             if "position_done_delay_sec" in task_cfg:
                 task_cfg["position_done_delay_sec"] = float(task_cfg["position_done_delay_sec"])
         return config

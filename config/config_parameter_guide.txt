@@ -1,0 +1,124 @@
+说明:
+1. 这个文件只用于人工查看参数含义, 程序不会读取这个 txt。
+2. 实际生效配置仍然是 config/config.json。
+3. 下面按当前 config/config.json 复制, 每个字段后面用 // 写参数说明。
+
+{
+    "communication": {                                      // 通讯参数
+        "lcr_port": "/dev/cu.PL2303G-USBtoUART1240",        // 同惠 LCR 电桥串口号
+        "hioki_ip": "192.168.250.5",                        // Hioki 匝间仪 IP 地址
+        "hioki_port": 6866,                                 // Hioki 匝间仪 TCP 端口
+        "hioki_use_table_command": true,                    // 是否通过通讯发送切表指令
+        "hioki_remote_before_start": true,                  // Hioki 测试前是否切到远程控制
+        "hioki_test_wait_sec": 5.0,                         // Hioki 启动测试后等待结果的时间, 单位秒
+        "plc_ip": "192.168.250.1",                          // PLC IP 地址
+        "plc_port": 9600,                                   // PLC FINS UDP 端口
+        "pc_node": 2,                                       // 上位机 FINS 节点号
+        "plc_node": 1,                                      // PLC FINS 节点号
+        "simulation": false,                                // 仿真模式开关, true 表示不连真实设备
+        "labjack_duration": 1.0                             // LabJack 采集时长, 单位秒
+    },
+    "plc_control": {                                        // PLC 控制参数
+        "done_delay_sec": 1.0,                              // 单个测试项目完成后, 延迟多久再发完成信号, 单位秒
+        "left_servo_speed_addrs": [3800],                   // 左伺服转速写入地址列表, 对应 D3800
+        "left_servo_speed_type": "float32",                 // 左伺服转速写入数据类型, float32/REAL
+        "left_servo_speed_value": 2888.0,                   // 左伺服默认转速
+        "pc_stop_addr": 4000,                               // 停止/复位信号写入地址, 对应 D4000
+        "pc_stop_value": 1,                                 // 停止/复位按下时写入的值
+        "pc_stop_idle_value": 0,                            // 停止/复位释放后写入的值
+        "pc_stop_reset_delay_sec": 0.5                      // 停止/复位写 1 后延迟多久写回 0, 单位秒
+    },
+    "plc_dm_addresses": {                                   // PLC DM 位信号配置
+        "word_addr": 3500,                                  // Bool 信号所在 DM 字地址, 对应 D3500
+        "poll_interval_sec": 0.2,                           // 轮询 PLC 信号间隔, 单位秒
+        "sequence": ["lcr", "hioki", "labjack"],            // 自动模式测试顺序
+        "heartbeat": {                                      // 心跳信号配置
+            "enabled": false,                               // 是否启用心跳
+            "plc_to_pc_bit": 0,                             // PLC -> PC 心跳位
+            "pc_to_plc_bit": 0                              // PC -> PLC 心跳位
+        },
+        "signals": {                                        // 各测试项目 PLC 位定义
+            "lcr": {                                        // 电阻电感测试
+                "name": "电阻电感",                         // 界面和日志显示名称
+                "ready_bit": 3,                             // PLC 就绪位, D3500.03
+                "start_bit": 1,                             // PC 开始测试位, D3500.01
+                "done_bit": 4,                              // PC 测试完成位, D3500.04
+                "position_done_bit": 8,                     // 当前工位采样完成位, D3500.08
+                "sample_count": 3,                          // 电阻电感采样位置数量, U/V/W 三组
+                "ready_delay_sec": 3.0,                     // PLC 就绪后延迟多久再开始读取, 单位秒
+                "stabilize_read_sec": 20.0,                 // 到位后稳定读取最长等待时长, 稳定后会提前结束, 单位秒
+                "stabilize_read_interval_sec": 0.5,         // 稳定读取期间每次读取间隔, 单位秒
+                "stabilize_required_count": 5,              // 连续多少次读数满足波动范围才认为稳定
+                "stabilize_discard_count": 6,               // 丢弃前多少次有效读数, 用于避开刚接触时偏高的数据
+                "stabilize_r_tolerance_mohm": 0.5,          // 电阻稳定判断允许波动, 单位 mΩ
+                "stabilize_l_tolerance_uh": 0.1,            // 电感稳定判断允许波动, 单位 µH
+                "stabilize_max_drop_mohm": 1.0,             // 连续稳定窗口内允许的最大电阻下降量, 单位 mΩ; 负数表示不限制
+                "position_done_delay_sec": 2.0,             // 单组测试结束后延迟多久再发位置完成位, 单位秒
+                "position_switch_timeout_sec": 60.0         // 等待 PLC 切换/复位工位超时时间, 单位秒
+            },
+            "hioki": {                                      // Hioki 匝间测试
+                "name": "匝间",                             // 界面和日志显示名称
+                "ready_bit": 3,                             // PLC 就绪位, D3500.03
+                "start_bit": 6,                             // PC 开始测试位, D3500.06
+                "done_bit": 4,                              // PC 测试完成位, D3500.04
+                "position_done_bit": 8,                     // 当前工位采样完成位, D3500.08
+                "sample_count": 3,                          // 匝间采样位置数量
+                "position_switch_timeout_sec": 60.0         // 等待 PLC 切换/复位工位超时时间, 单位秒
+            },
+            "labjack": {                                    // LabJack 反电势测试
+                "name": "反电势",                           // 界面和日志显示名称
+                "ready_bit": 3,                             // PLC 就绪位, D3500.03
+                "start_bit": 5,                             // PC 开始测试位, D3500.05
+                "done_bit": 4                               // PC 测试完成位, D3500.04
+            }
+        }
+    },
+    "compensation": {                                       // 补偿参数
+        "lcr_comp_r": 0.0,                                  // 同惠 LCR 驱动层电阻补偿, 单位 mΩ
+        "lcr_comp_l": 0.0,                                  // 同惠 LCR 驱动层电感补偿, 单位 µH
+        "resistance_compensation_mohm": {                   // 软件结果层 U/V/W 电阻补偿, 单位 mΩ
+            "u": 24.5,                                      // U 相电阻补偿
+            "v": 12.3,                                      // V 相电阻补偿
+            "w": -36.8                                      // W 相电阻补偿
+        },
+        "inductance_compensation_uh": {                     // 软件结果层 U/V/W 电感补偿, 单位 µH
+            "u": 0.04,                                      // U 相电感补偿
+            "v": -0.04,                                     // V 相电感补偿
+            "w": 0.0                                        // W 相电感补偿
+        }
+    },
+    "product_models": {                                     // 产品型号规格配置
+        "22MP224": {                                        // 产品型号 22MP224
+            "table_id": 2,                                  // Hioki 对应表号 TABLE 002
+            "R": [10.0, 15.0],                              // 电阻合格范围, 单位 mΩ
+            "L": [100.0, 120.0],                            // 电感合格范围, 单位 µH
+            "AREA": 5.0,                                    // 面积/面积系数, 当前用于型号参数预留
+            "Vp_min": 4.0,                                  // 反电势峰值最小合格值, 单位 V
+            "THD_max": 5.0                                  // THD 最大合格值, 单位 %
+        },
+        "22MP424": {                                        // 产品型号 22MP424
+            "table_id": 1,                                  // Hioki 对应表号 TABLE 001
+            "R": [20.0, 80.0],                              // 电阻合格范围, 单位 mΩ
+            "L": [2.0, 20.0],                               // 电感合格范围, 单位 µH
+            "AREA": 7.0,                                    // 面积/面积系数, 当前用于型号参数预留
+            "Vp_min": 4.0,                                  // 反电势峰值最小合格值, 单位 V
+            "THD_max": 5.0                                  // THD 最大合格值, 单位 %
+        },
+        "22MP448": {                                        // 产品型号 22MP448
+            "table_id": 5,                                  // Hioki 对应表号 TABLE 005
+            "R": [5.0, 8.0],                                // 电阻合格范围, 单位 mΩ
+            "L": [80.0, 90.0],                              // 电感合格范围, 单位 µH
+            "AREA": 10.0,                                   // 面积/面积系数, 当前用于型号参数预留
+            "Vp_min": 4.0,                                  // 反电势峰值最小合格值, 单位 V
+            "THD_max": 5.0                                  // THD 最大合格值, 单位 %
+        },
+        "19xxxx": {                                         // 产品型号 19xxxx
+            "table_id": 10,                                 // Hioki 对应表号 TABLE 010
+            "R": [5.0, 8.0],                                // 电阻合格范围, 单位 mΩ
+            "L": [80.0, 90.0],                              // 电感合格范围, 单位 µH
+            "AREA": 10.0,                                   // 面积/面积系数, 当前用于型号参数预留
+            "Vp_min": 4.0,                                  // 反电势峰值最小合格值, 单位 V
+            "THD_max": 5.0                                  // THD 最大合格值, 单位 %
+        }
+    }
+}

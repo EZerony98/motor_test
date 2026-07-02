@@ -40,13 +40,15 @@
                 "done_bit": 4,
                 "position_done_bit": 8,
                 "sample_count": 3,
-                "ready_delay_sec": 1.0,
-                "stabilize_read_sec": 2.0,
-                "stabilize_read_interval_sec": 0.2,
-                "stabilize_required_count": 3,
-                "stabilize_r_tolerance_mohm": 2.0,
-                "stabilize_l_tolerance_uh": 2.0,
-                "position_done_delay_sec": 1.0,
+                "ready_delay_sec": 3.0,
+                "stabilize_read_sec": 20.0,
+                "stabilize_read_interval_sec": 0.5,
+                "stabilize_required_count": 5,
+                "stabilize_discard_count": 6,
+                "stabilize_r_tolerance_mohm": 0.5,
+                "stabilize_l_tolerance_uh": 0.1,
+                "stabilize_max_drop_mohm": 1.0,
+                "position_done_delay_sec": 2.0,
                 "position_switch_timeout_sec": 60.0
             },
             "hioki": {
@@ -70,13 +72,13 @@
         "lcr_comp_r": 0.0,
         "lcr_comp_l": 0.0,
         "resistance_compensation_mohm": {
-            "u": 0.0,
-            "v": -40.0,
-            "w": -41.0
+            "u": 24.5,
+            "v": 12.3,
+            "w": -36.8
         },
         "inductance_compensation_uh": {
-            "u": 0.0,
-            "v": 0.0,
+            "u": 0.04,
+            "v": -0.04,
             "w": 0.0
         }
     },
