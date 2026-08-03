@@ -1,6 +1,6 @@
 {
     "communication": {
-        "lcr_port": "/dev/cu.PL2303G-USBtoUART1240",
+        "lcr_port": "/dev/cu.usbmodem5A7E0186141",
         "hioki_ip": "192.168.250.5",
         "hioki_port": 6866,
         "hioki_use_table_command": true,
@@ -72,13 +72,13 @@
         "lcr_comp_r": 0.0,
         "lcr_comp_l": 0.0,
         "resistance_compensation_mohm": {
-            "u": 24.5,
-            "v": 12.3,
-            "w": -36.8
+            "u": 0.0,
+            "v": 0.0,
+            "w": 0.0
         },
         "inductance_compensation_uh": {
-            "u": 0.04,
-            "v": -0.04,
+            "u": 0.0,
+            "v": 0.0,
             "w": 0.0
         }
     },
